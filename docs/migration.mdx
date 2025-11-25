@@ -1,0 +1,824 @@
+---
+title: Migration Guide
+description: Guide for migrating from password-based authentication to passkeys
+slug: migration
+order: 4
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Migration Strategies](#migration-strategies)
+  - [Parallel Running](#parallel-running)
+  - [Gradual Rollout](#gradual-rollout)
+  - [Full Cutover](#full-cutover)
+- [Step-by-Step Migration](#step-by-step-migration)
+- [Database Schema](#database-schema)
+- [Code Examples](#code-examples)
+- [Testing Migration](#testing-migration)
+- [Rollback Plan](#rollback-plan)
+- [Common Pitfalls](#common-pitfalls)
+
+---
+
+## Overview
+
+Moving from passwords to passkeys improves security, UX, and reduces support costs. Most migrations take 2-4 weeks.
+
+---
+
+## Migration Strategies
+
+### Strategy 1: Parallel Running (Recommended)
+
+Run both systems side-by-side. Users can choose passwords or passkeys.
+
+**Pros:** Lowest risk, gradual adoption, easy rollback  
+**Cons:** Temporary code complexity, maintain two auth systems  
+**Timeline:** 4-6 weeks  
+**Best for:** Production apps with existing users
+
+---
+
+### Strategy 2: Gradual Rollout
+
+Enable passkeys for specific user groups first (beta users, employees, etc.).
+
+**Pros:** Test with smaller groups, gather feedback, controlled risk  
+**Cons:** Requires feature flags, different UX temporarily  
+**Timeline:** 3-4 weeks  
+**Best for:** Apps with clear user segments
+
+---
+
+### Strategy 3: Full Cutover
+
+Replace passwords entirely. One auth system, fastest migration, but highest risk.
+
+**Pros:** Simplest codebase, fastest migration, clear message  
+**Cons:** Highest risk, may lose users, difficult rollback  
+**Timeline:** 1-2 weeks  
+**Best for:** New apps or internal tools
+
+---
+
+## Step-by-Step Migration
+
+### Phase 1: Preparation (Week 1)
+
+#### 1. Install and Configure
+
+```bash
+npm install @productiongrade/passkeys
+```
+
+```typescript
+// src/lib/passkeys.ts
+import { createPasskeys } from '@productiongrade/passkeys/express';
+import { PrismaAdapter } from '@productiongrade/passkeys/adapters/prisma';
+import { RedisChallengeStorage } from '@productiongrade/passkeys/adapters/redis';
+import prisma from './prisma';
+import redis from './redis';
+
+export const { router: passkeyRouter, services } = createPasskeys({
+  rpId: process.env.RP_ID || 'localhost',
+  rpName: 'My App',
+  origin: process.env.ORIGIN || 'http://localhost:3000',
+  storage: new PrismaAdapter(prisma),
+  challengeStorage: new RedisChallengeStorage(redis),
+  userVerification: 'preferred',
+  hooks: {
+    onAuthSuccess: async (userId, passkeyId) => {
+      // Your existing logging/analytics
+      analytics.track('passkey_auth', { userId, passkeyId });
+    },
+  },
+});
+```
+
+#### 2. Update Database Schema
+
+Add passkey tables to your existing database:
+
+```prisma
+// prisma/schema.prisma
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String?  // Make nullable for migration
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Add passkey relationships
+  passkeys            Passkey[]
+  recoveryCodes       RecoveryCode[]
+  emailRecoveryTokens EmailRecoveryToken[]
+
+  @@index([email])
+}
+
+// Add passkey tables
+model Passkey {
+  id         String    @id
+  userId     String
+  publicKey  String
+  counter    Int       @default(0)
+  transports String[]
+  deviceType String
+  backedUp   Boolean   @default(false)
+  nickname   String?
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model RecoveryCode {
+  id        String    @id @default(uuid())
+  userId    String
+  codeHash  String
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model EmailRecoveryToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+}
+```
+
+```bash
+npx prisma migrate dev --name add_passkeys
+```
+
+#### 3. Mount Passkey Routes
+
+```typescript
+// src/server.ts
+import express from 'express';
+import { passkeyRouter } from './lib/passkeys';
+
+const app = express();
+
+// Existing routes
+app.use('/api/auth/password', passwordAuthRouter); // Keep for now
+
+// New passkey routes
+app.use('/api/auth/passkey', passkeyRouter);
+
+// Existing routes
+app.use('/api', apiRouter);
+```
+
+---
+
+### Phase 2: Parallel Authentication (Week 2-3)
+
+#### 1. Update Login UI
+
+```tsx
+// components/LoginForm.tsx
+import { useState } from 'react';
+import { usePasskeyAuth } from '@productiongrade/passkeys/react';
+
+function LoginForm() {
+  const [email, setEmail] = useState('');
+  const [usePasskey, setUsePasskey] = useState(false);
+
+  // Existing password login
+  const passwordLogin = async () => {
+    const res = await fetch('/api/auth/password/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+    // Handle response
+  };
+
+  // New passkey login
+  const { authenticate, isLoading } = usePasskeyAuth({
+    apiUrl: '/api/auth/passkey',
+    onSuccess: (user) => {
+      setAuth(user);
+      navigate('/dashboard');
+    },
+  });
+
+  return (
+    <div>
+      <input
+        type="email"
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+      />
+
+      {/* Show both options */}
+      {usePasskey ? (
+        <>
+          <button onClick={() => authenticate(email)} disabled={isLoading}>
+            Sign in with Passkey
+          </button>
+          <a onClick={() => setUsePasskey(false)}>Use password instead</a>
+        </>
+      ) : (
+        <>
+          <input type="password" /* ... */ />
+          <button onClick={passwordLogin}>Sign in with Password</button>
+          <a onClick={() => setUsePasskey(true)}>Use passkey instead</a>
+        </>
+      )}
+    </div>
+  );
+}
+```
+
+#### 2. Add Passkey Enrollment for Existing Users
+
+```tsx
+// components/ProfileSettings.tsx
+import { usePasskeyRegistration } from '@productiongrade/passkeys/react';
+
+function SecuritySettings({ user }) {
+  const { register, isLoading } = usePasskeyRegistration({
+    apiUrl: '/api/auth/passkey',
+    onSuccess: () => {
+      alert('Passkey added! You can now sign in without a password.');
+    },
+  });
+
+  const hasPasskey = user.passkeyCount > 0;
+
+  return (
+    <div>
+      <h3>Security Settings</h3>
+
+      {!hasPasskey && (
+        <div className="upgrade-prompt">
+          <h4>🔐 Upgrade to Passkey Authentication</h4>
+          <p>More secure and faster than passwords</p>
+          <button onClick={() => register(user.email)} disabled={isLoading}>
+            Add Passkey
+          </button>
+        </div>
+      )}
+
+      {hasPasskey && (
+        <p>✅ You're using passkey authentication</p>
+      )}
+    </div>
+  );
+}
+```
+
+#### 3. Incentivize Migration
+
+```typescript
+// Add middleware to encourage passkey adoption
+app.use((req, res, next) => {
+  if (req.user && !req.user.hasPasskey) {
+    res.setHeader('X-Suggest-Passkey', 'true');
+  }
+  next();
+});
+```
+
+```tsx
+// Show banner to password users
+{!user.hasPasskey && (
+  <Banner variant="info">
+    <strong>Upgrade to Passkeys!</strong> Faster and more secure.
+    <button onClick={enrollPasskey}>Set Up Now</button>
+  </Banner>
+)}
+```
+
+---
+
+### Phase 3: Transition Period (Week 3-4)
+
+#### 1. Monitor Adoption Metrics
+
+```typescript
+// Track migration progress
+const passkeyAdoptionRate = async () => {
+  const totalUsers = await prisma.user.count();
+  const passkeyUsers = await prisma.user.count({
+    where: { passkeys: { some: {} } },
+  });
+  
+  return {
+    total: totalUsers,
+    passkeyUsers,
+    percentage: (passkeyUsers / totalUsers) * 100,
+  };
+};
+```
+
+#### 2. Send Migration Reminders
+
+```typescript
+// Send emails to users still using passwords
+const remindPasswordUsers = async () => {
+  const passwordOnlyUsers = await prisma.user.findMany({
+    where: {
+      password: { not: null },
+      passkeys: { none: {} },
+    },
+  });
+
+  for (const user of passwordOnlyUsers) {
+    await sendEmail(user.email, {
+      subject: 'Upgrade to Passkeys - More Secure & Convenient',
+      template: 'passkey-migration',
+    });
+  }
+};
+```
+
+#### 3. Deprecation Warnings
+
+```tsx
+// Show warnings to password users
+{authMethod === 'password' && (
+  <Alert variant="warning">
+    <strong>Password authentication will be deprecated on {deprecationDate}</strong>
+    <p>Please add a passkey to continue accessing your account.</p>
+    <button onClick={enrollPasskey}>Upgrade Now</button>
+  </Alert>
+)}
+```
+
+---
+
+### Phase 4: Complete Migration (Week 4+)
+
+#### 1. Deprecate Password Routes
+
+```typescript
+// src/server.ts
+app.use('/api/auth/password', (req, res) => {
+  res.status(410).json({
+    error: 'Password authentication is no longer supported',
+    message: 'Please use passkey authentication',
+    migrationGuide: 'https://docs.example.com/passkey-migration',
+  });
+});
+```
+
+#### 2. Clean Up Database
+
+```typescript
+// Remove password column (after ensuring all users have passkeys)
+// prisma/schema.prisma
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  // password  String?  // REMOVED
+  createdAt DateTime @default(now())
+  // ...
+}
+```
+
+```bash
+npx prisma migrate dev --name remove_passwords
+```
+
+#### 3. Update Documentation
+
+Update all user-facing documentation to reflect passkey-only authentication.
+
+---
+
+## Database Schema Considerations
+
+### Existing Users Table
+
+**Before:**
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+**After:**
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255),  -- Nullable during transition
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE passkeys (
+  id VARCHAR(255) PRIMARY KEY,  -- credential ID
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  public_key TEXT NOT NULL,
+  counter INTEGER DEFAULT 0,
+  -- ... other columns
+);
+```
+
+### Migration SQL
+
+```sql
+-- Step 1: Make password nullable
+ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+
+-- Step 2: Add passkey tables (via Prisma migrate)
+
+-- Step 3: After full migration, drop password column
+ALTER TABLE users DROP COLUMN password_hash;
+```
+
+---
+
+## Code Examples
+
+### Unified Auth Endpoint
+
+```typescript
+// Support both auth methods during transition
+app.post('/api/auth/login', async (req, res) => {
+  const { email, method } = req.body;
+
+  if (method === 'passkey') {
+    // Redirect to passkey flow
+    return res.redirect(307, '/api/auth/passkey/authenticate/start');
+  } else {
+    // Handle password login (during transition)
+    // ...legacy password code...
+  }
+});
+```
+
+### Check User Auth Methods
+
+```typescript
+// Helper to check what auth methods user has
+const getUserAuthMethods = async (userId: string) => {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: {
+      passkeys: true,
+    },
+  });
+
+  return {
+    hasPassword: !!user?.password,
+    hasPasskey: user?.passkeys.length > 0,
+    passkeyCount: user?.passkeys.length || 0,
+  };
+};
+```
+
+### Automatic Password Removal
+
+```typescript
+// After user successfully adds passkey, optionally remove password
+app.post('/api/auth/passkey/register/finish', async (req, res) => {
+  // ... verify passkey registration ...
+
+  const authMethods = await getUserAuthMethods(userId);
+  
+  if (authMethods.hasPassword && authMethods.passkeyCount === 1) {
+    // First passkey added - prompt to remove password
+    return res.json({
+      success: true,
+      data: { user, passkey },
+      suggestions: {
+        removePassword: {
+          message: 'You can now remove your password for better security',
+          action: '/api/auth/password/remove',
+        },
+      },
+    });
+  }
+
+  res.json({ success: true, data: { user, passkey } });
+});
+```
+
+---
+
+## Testing Migration
+
+### Test Scenarios
+
+1. **New User Registration**
+   - ✅ Can register with passkey only
+   - ✅ No password required
+
+2. **Existing User with Password**
+   - ✅ Can still log in with password
+   - ✅ Can add passkey while logged in
+   - ✅ Can use either method after adding passkey
+   - ✅ Can remove password after adding passkey
+
+3. **Existing User with Passkey**
+   - ✅ Can log in with passkey
+   - ✅ Cannot access password routes
+
+4. **Account Recovery**
+   - ✅ Recovery codes work
+   - ✅ Email recovery works
+   - ✅ Can regain access without password
+
+### Testing Checklist
+
+- [ ] Password users can still log in
+- [ ] Passkey enrollment works from settings
+- [ ] New registrations use passkeys only
+- [ ] Both auth methods work simultaneously
+- [ ] Sessions work correctly for both methods
+- [ ] Analytics track both auth types
+- [ ] Email notifications sent correctly
+- [ ] Rollback plan tested
+- [ ] Load testing with both methods
+- [ ] Security audit completed
+
+---
+
+## Rollback Plan
+
+### Quick Rollback (If Issues Arise)
+
+#### 1. Disable Passkey Routes
+
+```typescript
+// Temporarily disable passkey routes
+app.use('/api/auth/passkey', (req, res) => {
+  res.status(503).json({
+    error: 'Passkey authentication temporarily unavailable',
+    message: 'Please use password authentication',
+  });
+});
+```
+
+#### 2. Feature Flag
+
+```typescript
+// Use feature flags for gradual rollout
+const isPasskeyEnabled = await featureFlags.isEnabled('passkey-auth', user);
+
+if (!isPasskeyEnabled) {
+  return res.status(503).json({ error: 'Feature not enabled' });
+}
+```
+
+#### 3. Database Rollback
+
+```bash
+# If you need to roll back database changes
+npx prisma migrate resolve --rolled-back <migration-name>
+```
+
+### Data Preservation
+
+**Important:** Never delete password data until:
+- ✅ All users have passkeys
+- ✅ Migration is complete and stable
+- ✅ Recovery mechanisms tested
+- ✅ At least 30 days have passed
+
+---
+
+## Common Pitfalls
+
+### 1. Forcing Migration Too Quickly
+
+❌ **Wrong:** Removing passwords before users are ready  
+✅ **Right:** Give users 4-6 weeks to transition
+
+### 2. Inadequate Recovery Options
+
+❌ **Wrong:** No fallback if user loses device  
+✅ **Right:** Implement recovery codes AND email recovery
+
+### 3. Poor Browser Support Communication
+
+❌ **Wrong:** Showing passkey UI on unsupported browsers  
+✅ **Right:** Check `isWebAuthnSupported()` and show fallback
+
+### 4. Missing HTTPS in Production
+
+❌ **Wrong:** Trying to use passkeys over HTTP  
+✅ **Right:** WebAuthn requires HTTPS (except localhost)
+
+### 5. Not Testing Account Recovery
+
+❌ **Wrong:** Assuming recovery works without testing  
+✅ **Right:** Thoroughly test all recovery scenarios
+
+### 6. Inadequate User Education
+
+❌ **Wrong:** No explanation of what passkeys are  
+✅ **Right:** Provide clear documentation and help links
+
+### 7. Removing Password Too Early
+
+❌ **Wrong:** Deleting password column immediately  
+✅ **Right:** Keep nullable password for transition period
+
+---
+
+## Migration Checklist
+
+### Pre-Migration
+
+- [ ] Install @productiongrade/passkeys
+- [ ] Add database schema
+- [ ] Set up storage adapters
+- [ ] Configure HTTPS (production)
+- [ ] Create rollback plan
+- [ ] Document new user flows
+- [ ] Train support team
+
+### During Migration
+
+- [ ] Mount passkey routes
+- [ ] Update login UI with both options
+- [ ] Add passkey enrollment to settings
+- [ ] Track adoption metrics
+- [ ] Send migration reminders
+- [ ] Monitor error rates
+- [ ] Gather user feedback
+
+### Post-Migration
+
+- [ ] Verify 100% user coverage
+- [ ] Remove password authentication
+- [ ] Clean up database schema
+- [ ] Update documentation
+- [ ] Archive old code
+- [ ] Celebrate 🎉
+
+---
+
+## Next.js Migration
+
+### App Router (Next.js 14+) - Recommended
+
+The Next.js adapter is built for the App Router and provides the simplest integration:
+
+```typescript
+// app/api/auth/passkeys/[[...passkey]]/route.ts
+import { createNextPasskeys } from '@productiongrade/passkeys/nextjs';
+import { storage } from '@/lib/storage';
+
+const { POST, GET, DELETE, PATCH } = createNextPasskeys({
+  rpId: process.env.NEXT_PUBLIC_RP_ID!,
+  rpName: 'My App',
+  origin: process.env.NEXT_PUBLIC_APP_URL!,
+  storage,
+});
+
+export { POST, GET, DELETE, PATCH };
+```
+
+### Pages Router - Manual Integration
+
+If you're using Next.js Pages Router, you'll need to manually integrate using the core services:
+
+#### Step 1: Create API Routes
+
+```typescript
+// pages/api/auth/passkeys/register/start.ts
+import type { NextApiRequest, NextApiResponse } from 'next';
+import { PasskeyService } from '@productiongrade/passkeys';
+import { ChallengeService } from '@productiongrade/passkeys';
+import { storage, challengeStorage } from '@/lib/storage';
+
+const passkeyService = new PasskeyService(storage, {
+  rpId: process.env.NEXT_PUBLIC_RP_ID!,
+  rpName: 'My App',
+  origin: process.env.NEXT_PUBLIC_APP_URL!,
+  storage,
+});
+
+const challengeService = new ChallengeService(challengeStorage);
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    // Generate registration options
+    const { options, userId } = await passkeyService.generateRegistrationOptions(email);
+
+    // Store challenge
+    await challengeService.store(options.challenge, 'registration', userId, email);
+
+    res.status(200).json({
+      success: true,
+      data: options,
+      userId,
+    });
+  } catch (error) {
+    console.error('Registration start failed:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+```
+
+#### Step 2: Repeat for Each Endpoint
+
+Create similar API routes for:
+- `/api/auth/passkeys/register/finish.ts`
+- `/api/auth/passkeys/authenticate/start.ts`
+- `/api/auth/passkeys/authenticate/finish.ts`
+- `/api/auth/passkeys/passkeys.ts` (GET for list, DELETE for delete)
+- `/api/auth/passkeys/passkeys/[id].ts` (PATCH for update)
+
+#### Step 3: Frontend Integration
+
+Use the React hooks as normal - they work with both App Router and Pages Router:
+
+```typescript
+import { usePasskeyRegistration } from '@productiongrade/passkeys/react';
+
+export default function RegisterPage() {
+  const { register, loading } = usePasskeyRegistration({
+    apiBasePath: '/api/auth/passkeys',
+  });
+
+  // ... rest of component
+}
+```
+
+### Migrating from Pages Router to App Router
+
+If you're migrating from Pages Router to App Router:
+
+**Option 1: Gradual Migration**
+- Keep Pages Router API routes working
+- Add new App Router routes alongside
+- Gradually move frontend to use new routes
+- Remove old routes when ready
+
+**Option 2: Direct Migration**
+1. Replace all `/pages/api/auth/passkeys/**/*.ts` files with single `/app/api/auth/passkeys/[[...passkey]]/route.ts`
+2. Update any hardcoded endpoint references
+3. Test all flows thoroughly
+4. Deploy
+
+**Migration checklist:**
+- [ ] Backup your database
+- [ ] Test App Router routes in development
+- [ ] Verify React hooks work with new endpoints
+- [ ] Check authentication flows
+- [ ] Test management endpoints
+- [ ] Update environment variables if needed
+- [ ] Deploy to staging first
+- [ ] Monitor error logs after production deploy
+
+---
+
+## Support & Resources
+
+- **Documentation**: [README.md](../README.md)
+- **API Reference**: [API.mdx](./api-reference.mdx)
+- **React Hooks**: [REACT.mdx](./react-integration.mdx)
+- **Troubleshooting**: [TROUBLESHOOTING.mdx](./troubleshooting.mdx)
+- **Issues**: https://github.com/Production-Grade/passkeys/issues
+
+---
+
+## Need Help?
+
+If you're stuck or need guidance:
+
+1. Check [TROUBLESHOOTING.mdx](./troubleshooting.mdx)
+2. Search [existing issues](https://github.com/Production-Grade/passkeys/issues)
+3. Ask in [Discussions](https://github.com/Production-Grade/passkeys/discussions)
+4. Email: support@productiongrade.tech
+
+Good luck with your migration! 🚀
+

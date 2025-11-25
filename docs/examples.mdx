@@ -1,0 +1,463 @@
+---
+title: Examples
+description: Common patterns and real-world code examples
+slug: examples
+order: 2
+---
+
+## Registration Flow
+
+Complete registration with error handling:
+
+```typescript
+import { createPasskeys } from '@productiongrade/passkeys/express';
+import { PrismaAdapter } from '@productiongrade/passkeys/adapters/prisma';
+
+const { router } = createPasskeys({
+  rpId: 'example.com',
+  rpName: 'My App',
+  origin: 'https://example.com',
+  storage: new PrismaAdapter(prisma),
+  challengeStorage: redisChallenges,
+});
+
+app.use('/api/auth', router);
+```
+
+Frontend (React):
+
+```tsx
+import { usePasskeyRegistration } from '@productiongrade/passkeys/react';
+
+function RegisterForm() {
+  const { register, isLoading, error } = usePasskeyRegistration({
+    apiUrl: '/api/auth',
+    onSuccess: (user, passkey) => {
+      // User registered, create session
+      setSession(user);
+      navigate('/dashboard');
+    },
+    onError: (error) => {
+      if (error.code === 'EMAIL_EXISTS') {
+        setMessage('Email already registered. Try signing in instead.');
+      } else {
+        setMessage(`Registration failed: ${error.message}`);
+      }
+    },
+  });
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const email = (e.target as HTMLFormElement).email.value;
+    await register(email);
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input type="email" name="email" required />
+      <button type="submit" disabled={isLoading}>
+        {isLoading ? 'Creating passkey...' : 'Register'}
+      </button>
+      {error && <div className="error">{error.message}</div>}
+    </form>
+  );
+}
+```
+
+---
+
+## Authentication Flow
+
+Sign in with email or autofill UI:
+
+```tsx
+import { usePasskeyAuth } from '@productiongrade/passkeys/react';
+
+function LoginForm() {
+  const { authenticate, isLoading } = usePasskeyAuth({
+    apiUrl: '/api/auth',
+    onSuccess: (user) => {
+      setSession(user);
+      navigate('/dashboard');
+    },
+  });
+
+  // Specific user
+  const handleEmailLogin = () => authenticate('user@example.com');
+
+  // Autofill UI (browser shows all passkeys)
+  const handleAutofillLogin = () => authenticate();
+
+  return (
+    <div>
+      <button onClick={handleEmailLogin} disabled={isLoading}>
+        Sign in with Email
+      </button>
+      <button onClick={handleAutofillLogin} disabled={isLoading}>
+        Sign in with Any Passkey
+      </button>
+    </div>
+  );
+}
+```
+
+---
+
+## Passkey Management
+
+List, rename, and delete passkeys:
+
+```tsx
+import { usePasskeyManagement } from '@productiongrade/passkeys/react';
+
+function PasskeySettings() {
+  const { passkeys, updateNickname, deletePasskey, refresh } = usePasskeyManagement({
+    apiUrl: '/api/auth',
+    authToken: getSessionToken(),
+  });
+
+  return (
+    <div>
+      <h2>Your Passkeys</h2>
+      {passkeys?.map((passkey) => (
+        <div key={passkey.id}>
+          <span>{passkey.nickname || 'Unnamed Device'}</span>
+          <button onClick={() => updateNickname(passkey.id, 'My Laptop')}>
+            Rename
+          </button>
+          <button onClick={() => deletePasskey(passkey.id)}>
+            Delete
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+---
+
+## Session Management
+
+Express with cookie-based sessions:
+
+```typescript
+import session from 'express-session';
+import { createPasskeys } from '@productiongrade/passkeys/express';
+
+app.use(session({
+  secret: process.env.SESSION_SECRET!,
+  resave: false,
+  saveUninitialized: false,
+}));
+
+const { router, handlers } = createPasskeys({ /* config */ });
+
+// Custom handler that sets session
+app.post('/api/auth/authenticate/finish', async (req, res, next) => {
+  try {
+    const result = await handlers.finishAuthentication(req, res);
+    if (result.success) {
+      req.session.userId = result.data.user.id;
+      req.session.save();
+    }
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Protected route
+app.get('/api/profile', (req, res) => {
+  if (!req.session.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  res.json({ userId: req.session.userId });
+});
+```
+
+Next.js with JWT:
+
+```typescript
+import jwt from 'jsonwebtoken';
+import { createNextPasskeys } from '@productiongrade/passkeys/nextjs';
+
+const { POST } = createNextPasskeys({
+  // ... config
+  hooks: {
+    onAuthSuccess: async (userId) => {
+      // Create JWT token
+      const token = jwt.sign({ userId }, process.env.JWT_SECRET!);
+      // Set cookie or return in response
+    },
+  },
+});
+```
+
+---
+
+## Recovery Codes
+
+Generate and verify recovery codes:
+
+```typescript
+// Generate codes (after user registers)
+app.post('/api/auth/recovery/codes/generate', middleware.requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  const codes = await recoveryService.generateRecoveryCodes(userId, 10);
+  
+  // Show codes to user ONCE, then hash and store
+  res.json({ codes }); // User should save these
+});
+
+// Verify code (when user lost device)
+app.post('/api/auth/recovery/codes/verify', async (req, res) => {
+  const { userId, code } = req.body;
+  const valid = await recoveryService.verifyRecoveryCode(userId, code);
+  
+  if (valid) {
+    // Create session for user
+    req.session.userId = userId;
+    res.json({ success: true });
+  } else {
+    res.status(401).json({ error: 'Invalid recovery code' });
+  }
+});
+```
+
+---
+
+## Email Recovery
+
+Send recovery token via email:
+
+```typescript
+import { createPasskeys } from '@productiongrade/passkeys/express';
+import { sendEmail } from './email-service';
+
+const { router } = createPasskeys({
+  // ... config
+  recovery: {
+    email: {
+      enabled: true,
+      sendEmail: async (to, token, userId) => {
+        await sendEmail({
+          to,
+          subject: 'Account Recovery',
+          html: `
+            <p>Click to recover your account:</p>
+            <a href="https://example.com/recover?token=${token}">
+              Recover Account
+            </a>
+            <p>This link expires in 60 minutes.</p>
+          `,
+        });
+      },
+      tokenTTL: 60, // minutes
+    },
+  },
+});
+```
+
+Verify token:
+
+```typescript
+app.get('/recover', async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ error: 'Token required' });
+  
+  try {
+    const userId = await recoveryService.verifyEmailRecoveryToken(token as string);
+    // Token valid, create session
+    req.session.userId = userId;
+    res.redirect('/dashboard');
+  } catch (error) {
+    res.status(400).json({ error: 'Invalid or expired token' });
+  }
+});
+```
+
+---
+
+## Security Hooks
+
+Monitor authentication events:
+
+```typescript
+const { router } = createPasskeys({
+  // ... config
+  hooks: {
+    onCounterAnomaly: async (userId, passkeyId, expected, received) => {
+      // Log security event
+      await securityLog.create({
+        type: 'COUNTER_ANOMALY',
+        userId,
+        passkeyId,
+        expected,
+        received,
+        timestamp: new Date(),
+      });
+      
+      // Alert security team
+      await alertService.send({
+        severity: 'high',
+        message: `Counter anomaly detected for user ${userId}`,
+      });
+      
+      // Optionally lock account
+      await lockUserAccount(userId);
+    },
+    
+    onAuthFailure: async (email, error) => {
+      // Track failed attempts
+      await rateLimiter.recordFailure(email);
+    },
+    
+    onRegistrationSuccess: async (userId, passkeyId) => {
+      // Send welcome email
+      await sendWelcomeEmail(userId);
+    },
+  },
+});
+```
+
+---
+
+## Error Handling
+
+Type-safe error handling with type guards:
+
+```typescript
+import { 
+  isAuthenticationError, 
+  isValidationError,
+  getErrorDetails 
+} from '@productiongrade/passkeys';
+
+try {
+  await passkeyService.verifyAuthentication(credential);
+} catch (error) {
+  if (isAuthenticationError(error)) {
+    // Handle auth failure
+    console.error('Auth failed:', error.message);
+    if (error.details?.troubleshooting) {
+      console.log('Help:', error.details.troubleshooting);
+    }
+  } else if (isValidationError(error)) {
+    // Handle validation error
+    console.error('Invalid input:', error.message);
+  } else {
+    // Unknown error
+    const details = getErrorDetails(error);
+    console.error('Unexpected error:', details.message);
+  }
+}
+```
+
+Express error handler:
+
+```typescript
+import { errorHandler } from '@productiongrade/passkeys/express';
+
+app.use('/api/auth', router);
+app.use(errorHandler); // Mount last - handles all errors
+```
+
+---
+
+## Configuration Validation
+
+Validate config at startup:
+
+```typescript
+import { assertValidConfig } from '@productiongrade/passkeys';
+
+const config = {
+  rpId: process.env.RP_ID!,
+  rpName: 'My App',
+  origin: process.env.ORIGIN!,
+  storage: new PrismaAdapter(prisma),
+  challengeStorage: redisChallenges,
+};
+
+// Throws ValidationError if invalid
+assertValidConfig(config);
+
+const { router } = createPasskeys(config);
+```
+
+Or check without throwing:
+
+```typescript
+import { validatePasskeyConfig } from '@productiongrade/passkeys';
+
+const result = validatePasskeyConfig(config);
+if (!result.valid) {
+  console.error('Config errors:', result.errors);
+  process.exit(1);
+}
+```
+
+---
+
+## Testing
+
+Unit test with mock storage:
+
+```typescript
+import { createMockStorage, createMockPasskeyConfig } from '@productiongrade/passkeys/testing';
+import { PasskeyService } from '@productiongrade/passkeys';
+
+describe('PasskeyService', () => {
+  it('should register a new user', async () => {
+    const storage = createMockStorage();
+    const config = createMockPasskeyConfig();
+    const service = new PasskeyService(storage, config);
+    
+    const { options, userId } = await service.generateRegistrationOptions('test@example.com');
+    expect(options).toBeDefined();
+    expect(userId).toBeDefined();
+  });
+});
+```
+
+Integration test:
+
+```typescript
+import { createPasskeys } from '@productiongrade/passkeys/express';
+import { createMockStorage } from '@productiongrade/passkeys/testing';
+
+describe('Registration endpoint', () => {
+  it('should create user and return options', async () => {
+    const storage = createMockStorage();
+    const { router } = createPasskeys({
+      rpId: 'test.com',
+      rpName: 'Test',
+      origin: 'https://test.com',
+      storage,
+      challengeStorage: createMockChallengeStorage(),
+    });
+    
+    const app = express();
+    app.use(express.json());
+    app.use('/auth', router);
+    
+    const res = await request(app)
+      .post('/auth/register/start')
+      .send({ email: 'test@example.com' });
+    
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveProperty('challenge');
+  });
+});
+```
+
+---
+
+## Next Steps
+
+- [API Reference](./api-reference.mdx) - Full API docs
+- [Best Practices](./best-practices.mdx) - Security and performance
+- [Configuration](./configuration.mdx) - All config options
+- [Patterns](./patterns.mdx) - Advanced patterns and recipes
+

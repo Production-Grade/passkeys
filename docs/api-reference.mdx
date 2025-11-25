@@ -1,0 +1,859 @@
+---
+title: API Reference
+description: Complete API documentation for @productiongrade/passkeys library
+slug: api-reference
+order: 1
+---
+
+## Table of Contents
+
+- [Core Services](#core-services)
+  - [PasskeyService](#passkeyservice)
+  - [ChallengeService](#challengeservice)
+  - [RecoveryService](#recoveryservice)
+- [Storage Interfaces](#storage-interfaces)
+  - [PasskeyStorage](#passkeystorage)
+  - [ChallengeStorage](#challengestorage)
+- [Express Adapter](#express-adapter)
+  - [createPasskeys()](#createpasskeys)
+  - [Middleware](#middleware)
+  - [Handlers](#handlers)
+- [React Hooks](#react-hooks)
+- [Type Definitions](#type-definitions)
+- [Error Classes](#error-classes)
+- [Utility Functions](#utility-functions)
+- [Type Guards](#type-guards)
+- [Configuration Utilities](#configuration-utilities)
+- [Debug Utilities](#debug-utilities)
+- [Testing Utilities](#testing-utilities)
+
+---
+
+## Core Services
+
+Use these services directly when building custom integrations or when the Express/Next.js adapters don't fit your needs.
+
+### PasskeyService
+
+Handles passkey registration and authentication. You'll typically use this through the Express or Next.js adapters, but it's available for custom implementations.
+
+```typescript
+new PasskeyService(storage: PasskeyStorage, config: PasskeyConfig)
+```
+
+**Constructor:**
+- `storage` - Your storage implementation
+- `config` - RP ID, origin, and optional hooks
+
+##### `generateRegistrationOptions(email: string)`
+
+Creates the WebAuthn options needed to start registration. Returns both the options and a generated user ID.
+
+```typescript
+async generateRegistrationOptions(email: string): Promise<{
+  options: PublicKeyCredentialCreationOptionsJSON;
+  userId: string;
+}>
+```
+
+Throws `ValidationError` if the email is invalid, or `RegistrationError` if something goes wrong during setup.
+
+```typescript
+const { options, userId } = await passkeyService.generateRegistrationOptions(
+  'user@example.com'
+);
+```
+
+##### `verifyRegistration(userId: string, credential: RegistrationResponseJSON)`
+
+Verifies the WebAuthn response and saves the new passkey. Call this after the user completes the browser prompt.
+
+```typescript
+async verifyRegistration(
+  userId: string,
+  credential: RegistrationResponseJSON
+): Promise<Passkey>
+```
+
+Throws `RegistrationError` if verification fails, or `ValidationError` if the user doesn't exist.
+
+```typescript
+const passkey = await passkeyService.verifyRegistration(
+  userId,
+  credentialFromClient
+);
+```
+
+##### `generateAuthenticationOptions(email?: string)`
+
+Creates authentication options. Pass an email to filter to that user's passkeys, or omit it for autofill UI where the browser shows all available passkeys.
+
+```typescript
+async generateAuthenticationOptions(email?: string): Promise<{
+  options: PublicKeyCredentialRequestOptionsJSON;
+  userId?: string;
+}>
+```
+
+```typescript
+// Specific user
+const { options } = await passkeyService.generateAuthenticationOptions(
+  'user@example.com'
+);
+
+// Autofill UI (browser shows all passkeys)
+const { options } = await passkeyService.generateAuthenticationOptions();
+```
+
+##### `verifyAuthentication(credential: AuthenticationResponseJSON)`
+
+Verifies the authentication response and returns the authenticated user. The passkey's counter is automatically updated.
+
+```typescript
+async verifyAuthentication(
+  credential: AuthenticationResponseJSON
+): Promise<{ user: User; passkey: Passkey }>
+```
+
+Throws `AuthenticationError` on failure, `CounterAnomalyError` if a cloned credential is detected, or `PasskeyNotFoundError` if the credential doesn't exist.
+
+```typescript
+const { user, passkey } = await passkeyService.verifyAuthentication(
+  credentialFromClient
+);
+```
+
+##### `getUserPasskeys(userId: string)`
+
+Lists all passkeys registered to a user.
+
+```typescript
+async getUserPasskeys(userId: string): Promise<Passkey[]>
+```
+
+##### `updatePasskeyNickname(userId: string, passkeyId: string, nickname: string)`
+
+Updates a passkey's display name. The `userId` ensures users can only rename their own passkeys.
+
+```typescript
+async updatePasskeyNickname(
+  userId: string,
+  passkeyId: string,
+  nickname: string
+): Promise<Passkey>
+```
+
+Throws `PasskeyNotFoundError` if the passkey doesn't exist or belongs to another user.
+
+##### `deletePasskey(userId: string, passkeyId: string)`
+
+Removes a passkey. Prevents deleting the user's last passkey (throws `ValidationError`).
+
+```typescript
+async deletePasskey(userId: string, passkeyId: string): Promise<void>
+```
+
+Throws `PasskeyNotFoundError` if the passkey doesn't exist or belongs to another user.
+
+---
+
+### ChallengeService
+
+Handles WebAuthn challenges with 5-minute expiration. Challenges prevent replay attacks by ensuring each authentication attempt uses a unique, time-limited value.
+
+```typescript
+new ChallengeService(storage: ChallengeStorage)
+```
+
+##### `create(type: ChallengeType, userId?: string, email?: string)`
+
+Creates a challenge that expires in 5 minutes. Use `userId` for authentication challenges, `email` for registration.
+
+```typescript
+async create(
+  type: 'registration' | 'authentication',
+  userId?: string,
+  email?: string
+): Promise<Challenge>
+```
+
+##### `verify(clientDataJSON: string)`
+
+Verifies the challenge from the WebAuthn response. Throws `InvalidChallengeError` if the challenge is missing or expired.
+
+```typescript
+async verify(clientDataJSON: string): Promise<Challenge>
+```
+
+##### `delete(challengeId: string)`
+
+Deletes a challenge after verification to enforce single-use.
+
+```typescript
+async delete(challengeId: string): Promise<void>
+```
+
+---
+
+### RecoveryService
+
+Manages recovery codes and email recovery tokens. Recovery codes are single-use and bcrypt-hashed. Email tokens expire after 60 minutes (configurable).
+
+```typescript
+new RecoveryService(storage: PasskeyStorage, config: PasskeyConfig)
+```
+
+##### `generateRecoveryCodes(userId: string, count: number)`
+
+Generates recovery codes and replaces any existing ones. Returns plaintext codes that you should show to the user once—they're hashed before storage.
+
+```typescript
+async generateRecoveryCodes(
+  userId: string,
+  count: number = 10
+): Promise<string[]>
+```
+
+Codes are 16 characters, alphanumeric only (no ambiguous characters like 0/O or 1/l).
+
+##### `verifyRecoveryCode(userId: string, code: string)`
+
+Verifies a recovery code and marks it as used. Returns `true` if valid, `false` if invalid or already used.
+
+```typescript
+async verifyRecoveryCode(userId: string, code: string): Promise<boolean>
+```
+
+##### `getRecoveryCodeCount(userId: string)`
+
+Returns how many unused recovery codes the user has left.
+
+```typescript
+async getRecoveryCodeCount(userId: string): Promise<number>
+```
+
+##### `initiateEmailRecovery(email: string)`
+
+Sends an email recovery token. Requires `recovery.email.sendEmail` in your config. The token expires in 60 minutes by default (configurable via `tokenTTL`).
+
+```typescript
+async initiateEmailRecovery(email: string): Promise<{
+  token: string;
+  userId: string;
+  expiresAt: Date;
+}>
+```
+
+Returns a plaintext token to include in the email. The token is SHA-256 hashed before storage. Throws `ValidationError` if the email doesn't exist (with timing-safe delay to prevent enumeration).
+
+##### `verifyEmailRecoveryToken(token: string)`
+
+Verifies the email token and marks it as used. Returns the user ID if valid.
+
+```typescript
+async verifyEmailRecoveryToken(token: string): Promise<string>
+```
+
+Throws `ValidationError` if the token is invalid, expired, or already used.
+
+---
+
+## Storage Interfaces
+
+Implement these interfaces to connect the library to your database. See [storage-adapters.mdx](./storage-adapters.mdx) for implementation examples.
+
+### PasskeyStorage
+
+Stores users, passkeys, and recovery data. Your implementation must enforce email uniqueness and handle cascading deletes.
+
+```typescript
+interface PasskeyStorage {
+  // User operations
+  createUser(input: CreateUserInput): Promise<User>;
+  getUserById(id: string): Promise<User | null>;
+  getUserByEmail(email: string): Promise<User | null>;
+  updateUser(id: string, updates: Partial<User>): Promise<User>;
+  deleteUser(id: string): Promise<void>;
+
+  // Passkey operations
+  createPasskey(input: CreatePasskeyInput): Promise<Passkey>;
+  getPasskeyById(id: string): Promise<Passkey | null>;
+  getPasskeyByCredentialId(credentialId: string): Promise<Passkey | null>;
+  getUserPasskeys(userId: string): Promise<Passkey[]>;
+  updatePasskey(id: string, updates: Partial<Passkey>): Promise<Passkey>;
+  deletePasskey(id: string): Promise<void>;
+
+  // Recovery code operations
+  createRecoveryCodes(inputs: CreateRecoveryCodeInput[]): Promise<RecoveryCode[]>;
+  getUserRecoveryCodes(userId: string): Promise<RecoveryCode[]>;
+  markRecoveryCodeUsed(id: string): Promise<void>;
+  getRecoveryCodeCount(userId: string): Promise<number>;
+  deleteUserRecoveryCodes(userId: string): Promise<void>;
+
+  // Email recovery operations
+  createEmailRecoveryToken(input: CreateEmailRecoveryTokenInput): Promise<EmailRecoveryToken>;
+  getEmailRecoveryToken(id: string): Promise<EmailRecoveryToken | null>;
+  getEmailRecoveryTokenByHash(tokenHash: string): Promise<EmailRecoveryToken | null>;
+  markEmailRecoveryTokenUsed(id: string): Promise<void>;
+  deleteExpiredEmailRecoveryTokens(): Promise<void>;
+}
+```
+
+### ChallengeStorage
+
+Stores WebAuthn challenges with 5-minute TTL. Use Redis or similar ephemeral storage—challenges are high-frequency and short-lived.
+
+```typescript
+interface ChallengeStorage {
+  createChallenge(input: CreateChallengeInput): Promise<Challenge>;
+  getChallengeById(id: string): Promise<Challenge | null>;
+  getChallengeByValue(challenge: string): Promise<Challenge | null>;
+  deleteChallenge(id: string): Promise<void>;
+  deleteExpiredChallenges(): Promise<void>;
+}
+```
+
+---
+
+## Express Adapter
+
+### createPasskeys()
+
+Creates an Express router with all passkey authentication routes. Mount it on your app and you're done.
+
+```typescript
+function createPasskeys(config: PasskeyConfig): {
+  router: Router;
+  handlers: PasskeyHandlers;
+  services: {
+    passkeyService: PasskeyService;
+    challengeService: ChallengeService;
+    recoveryService: RecoveryService;
+  };
+}
+```
+
+Returns the router plus handlers and services if you need custom routing or direct service access.
+
+```typescript
+const { router } = createPasskeys({
+  rpId: 'example.com',
+  rpName: 'My App',
+  origin: 'https://example.com',
+  storage: new MemoryStorage(),
+  challengeStorage: new MemoryChallengeStorage(),
+});
+
+app.use('/auth', router);
+```
+
+### Middleware
+
+#### `requireAuth`
+
+Checks that `req.user.id` exists (set by your session middleware). Returns 401 if missing.
+
+```typescript
+requireAuth(req: Request, res: Response, next: NextFunction): void
+```
+
+```typescript
+app.get('/profile', requireAuth, (req, res) => {
+  const userId = (req as any).user.id;
+  // ...
+});
+```
+
+#### `errorHandler`
+
+Converts errors to RFC 7807 Problem Details format. Mount this last in your middleware chain.
+
+```typescript
+errorHandler(
+  err: Error,
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void
+```
+
+```typescript
+app.use(errorHandler);
+```
+
+### Routes
+
+The router includes these endpoints. All errors return RFC 7807 Problem Details format.
+
+| Method | Path | Auth Required |
+|--------|------|---------------|
+| POST | `/register/start` | No |
+| POST | `/register/finish` | No |
+| POST | `/authenticate/start` | No |
+| POST | `/authenticate/finish` | No |
+| GET | `/passkeys` | Yes |
+| DELETE | `/passkeys/:id` | Yes |
+| POST | `/recovery/codes/generate` | Yes |
+| POST | `/recovery/codes/authenticate` | No |
+| GET | `/recovery/codes/count` | Yes |
+| POST | `/recovery/email/initiate` | No |
+| POST | `/recovery/email/verify` | No |
+
+---
+
+## Next.js Adapter
+
+Works with Next.js 14+ App Router. Creates route handlers you export from your API routes.
+
+### createNextPasskeys()
+
+Returns Next.js route handlers for passkey authentication. Export them from your route file.
+
+```typescript
+import { createNextPasskeys } from '@productiongrade/passkeys/nextjs';
+
+const { POST, GET, DELETE, PATCH } = createNextPasskeys(config);
+```
+
+Returns:
+- `POST` - Handles registration and authentication (required)
+- `GET` - Lists passkeys (requires `getUserId` callback)
+- `DELETE` - Deletes passkeys (requires `getUserId` callback)
+- `PATCH` - Updates passkey nicknames (requires `getUserId` callback)
+
+**Example:**
+
+```typescript
+// app/api/auth/passkeys/[[...passkey]]/route.ts
+import { createNextPasskeys } from '@productiongrade/passkeys/nextjs';
+import { PrismaAdapter } from '@productiongrade/passkeys/adapters/prisma';
+import { getServerSession } from 'next-auth';
+
+const { POST, GET, DELETE, PATCH } = createNextPasskeys({
+  rpId: process.env.NEXT_PUBLIC_RP_ID!,
+  rpName: 'My App',
+  origin: process.env.NEXT_PUBLIC_APP_URL!,
+  storage: new PrismaAdapter(prisma),
+  getUserId: async (request) => {
+    const session = await getServerSession();
+    return session?.user?.id ?? null;
+  },
+});
+
+export { POST, GET, DELETE, PATCH };
+```
+
+#### NextPasskeyConfig
+
+Same as `PasskeyConfig` plus an optional `getUserId` callback for authenticated endpoints.
+
+```typescript
+interface NextPasskeyConfig extends PasskeyConfig {
+  // Required (from PasskeyConfig)
+  rpId: string;
+  rpName: string;
+  origin: string;
+  storage: PasskeyStorage;
+
+  // Optional (from PasskeyConfig)
+  challengeStorage?: ChallengeStorage;
+  timeout?: number;
+  userVerification?: 'required' | 'preferred' | 'discouraged';
+  attestationType?: 'none' | 'indirect' | 'direct';
+  recovery?: RecoveryConfig;
+  hooks?: SecurityHooks;
+
+  // Next.js-specific
+  getUserId?: (request: NextRequest) => Promise<string | null> | string | null;
+}
+```
+
+**`getUserId` callback:**
+
+Extracts the authenticated user ID from the request. Required for GET, DELETE, and PATCH endpoints. Return `null` if not authenticated.
+
+```typescript
+// NextAuth
+getUserId: async (request) => {
+  const session = await getServerSession();
+  return session?.user?.id ?? null;
+}
+
+// Custom JWT
+getUserId: (request) => {
+  const token = request.headers.get('authorization')?.split(' ')[1];
+  if (!token) return null;
+  const payload = jwt.verify(token, SECRET);
+  return payload.userId;
+}
+
+// Cookies
+getUserId: async (request) => {
+  const sessionCookie = request.cookies.get('session');
+  if (!sessionCookie) return null;
+  const session = await getSessionFromStore(sessionCookie.value);
+  return session?.userId ?? null;
+}
+```
+
+### PasskeyProvider()
+
+NextAuth credentials provider. Use this if you're already using NextAuth for session management.
+
+```typescript
+import { PasskeyProvider } from '@productiongrade/passkeys/nextjs/provider';
+```
+
+```typescript
+// app/api/auth/[...nextauth]/route.ts
+import NextAuth from 'next-auth';
+import { PasskeyProvider } from '@productiongrade/passkeys/nextjs/provider';
+import { storage } from '@/lib/storage';
+
+const handler = NextAuth({
+  providers: [
+    PasskeyProvider({
+      rpId: process.env.NEXT_PUBLIC_RP_ID!,
+      rpName: 'My App',
+      origin: process.env.NEXT_PUBLIC_APP_URL!,
+      storage,
+    }),
+  ],
+});
+
+export { handler as GET, handler as POST };
+```
+
+Use `signIn('passkey', { credential })` to authenticate. Returns `{ id, email }` on success and automatically creates a NextAuth session.
+
+#### NextAuthPasskeyProviderConfig
+
+Same as `NextPasskeyConfig` but without `getUserId` (NextAuth handles sessions).
+
+```typescript
+interface NextAuthPasskeyProviderConfig {
+  rpId: string;
+  rpName: string;
+  origin: string;
+  storage: PasskeyStorage;
+  challengeStorage?: ChallengeStorage;
+  recovery?: RecoveryConfig;
+  hooks?: SecurityHooks;
+}
+```
+
+### API Endpoints
+
+With a catch-all route `[[...passkey]]`, these endpoints are available:
+
+**Registration:**
+- `POST /api/auth/passkeys/register/start` - Body: `{ email: string }`
+- `POST /api/auth/passkeys/register/finish` - Body: `{ userId: string, credential: RegistrationResponseJSON, nickname?: string }`
+
+**Authentication:**
+- `POST /api/auth/passkeys/authenticate/start` - Body: `{ email?: string }` (omit for autofill UI)
+- `POST /api/auth/passkeys/authenticate/finish` - Body: `{ credential: AuthenticationResponseJSON }`
+
+**Management** (requires `getUserId`):
+- `GET /api/auth/passkeys/passkeys` - List user's passkeys
+- `PATCH /api/auth/passkeys/passkeys/:id` - Body: `{ nickname: string }`
+- `DELETE /api/auth/passkeys/passkeys/:id` - Prevents deleting last passkey
+
+**Recovery** (if configured):
+- `POST /api/auth/passkeys/recovery/generate` - Body: `{ userId: string }`
+- `POST /api/auth/passkeys/recovery/verify` - Body: `{ userId: string, recoveryCode: string }`
+
+All endpoints return `{ success: true, data: ... }` on success, or RFC 7807 Problem Details on error (400 for validation, 401 for auth required, 404 for not found, etc.).
+
+---
+
+## React Hooks
+
+Three hooks for building passkey UIs. See [react-integration.mdx](./react-integration.mdx) for details.
+
+- `usePasskeyRegistration()` - Registration flow
+- `usePasskeyAuth()` - Authentication flow
+- `usePasskeyManagement()` - List, rename, and delete passkeys
+
+---
+
+## Type Definitions
+
+### PasskeyConfig
+
+Main configuration object. `rpId` should match your domain, `origin` is the full URL.
+
+```typescript
+interface PasskeyConfig {
+  rpId: string;                              // Your domain (e.g., 'example.com')
+  rpName: string;                            // App name shown to users
+  origin: string;                            // Full origin URL (e.g., 'https://example.com')
+  storage: PasskeyStorage;                   // Your storage implementation
+  challengeStorage?: ChallengeStorage;       // Optional, defaults to memory
+  userVerification?: UserVerification;       // 'required' | 'preferred' | 'discouraged'
+  timeout?: number;                          // WebAuthn timeout in ms (default: 60000)
+  recovery?: {
+    email?: {
+      enabled: boolean;
+      sendEmail: (to: string, token: string, userId: string) => Promise<void>;
+      tokenTTL?: number;                     // Token expiry in minutes (default: 60)
+    };
+  };
+  hooks?: SecurityHooks;                     // Optional event callbacks
+}
+```
+
+### SecurityHooks
+
+```typescript
+interface SecurityHooks {
+  onRegistrationStart?: (userId: string, email: string) => void | Promise<void>;
+  onRegistrationSuccess?: (userId: string, passkeyId: string) => void | Promise<void>;
+  onRegistrationFailure?: (userId: string, error: Error) => void | Promise<void>;
+  onAuthStart?: (email: string) => void | Promise<void>;
+  onAuthSuccess?: (userId: string, passkeyId: string) => void | Promise<void>;
+  onAuthFailure?: (email: string, error: Error) => void | Promise<void>;
+  onCounterAnomaly?: (userId: string, passkeyId: string, expected: number, received: number) => void | Promise<void>;
+  onRecoveryCodeUsed?: (userId: string) => void | Promise<void>;
+  onEmailRecoveryRequested?: (userId: string, email: string) => void | Promise<void>;
+  onEmailRecoveryCompleted?: (userId: string) => void | Promise<void>;
+  onRecoveryCodesRegenerated?: (userId: string, count: number) => void | Promise<void>;
+  onPasskeyDeleted?: (data: { userId: string; passkeyId: string }) => void | Promise<void>;
+}
+```
+
+### User
+
+```typescript
+interface User {
+  id: string;
+  email: string;
+  createdAt: Date;
+  updatedAt?: Date;
+}
+```
+
+### Passkey
+
+```typescript
+interface Passkey {
+  id: string;                                // Credential ID (base64url)
+  userId: string;
+  publicKey: string;                         // Base64url-encoded
+  counter: number;
+  deviceType: 'singleDevice' | 'multiDevice';
+  backedUp: boolean;
+  transports?: AuthenticatorTransport[];
+  nickname?: string;
+  createdAt: Date;
+  lastUsedAt?: Date;
+}
+```
+
+---
+
+## Error Classes
+
+All errors extend `PasskeyError` and include troubleshooting links in the details.
+
+```typescript
+class PasskeyError extends Error {
+  code: string;
+  statusCode: number;
+  details?: {
+    troubleshooting?: string;
+    commonCauses?: string[];
+    solutions?: string[];
+  };
+}
+```
+
+| Error | Code | Status |
+|-------|------|--------|
+| `RegistrationError` | `REGISTRATION_FAILED` | 400 |
+| `AuthenticationError` | `AUTHENTICATION_FAILED` | 401 |
+| `ValidationError` | `VALIDATION_ERROR` | 400 |
+| `PasskeyNotFoundError` | `PASSKEY_NOT_FOUND` | 404 |
+| `InvalidChallengeError` | `INVALID_CHALLENGE` | 400 |
+| `CounterAnomalyError` | `COUNTER_ANOMALY` | 401 |
+| `InvalidRecoveryCodeError` | `INVALID_RECOVERY_CODE` | 401 |
+
+Errors return RFC 7807 Problem Details format:
+
+```json
+{
+  "type": "https://castellan.dev/errors/authentication-failed",
+  "title": "AuthenticationError",
+  "status": 401,
+  "detail": "Authentication verification failed",
+  "troubleshooting": "https://castellan.dev/docs/troubleshooting#authentication-verification",
+  "commonCauses": ["Browser not supporting WebAuthn", "HTTPS required in production"]
+}
+```
+
+---
+
+## Utility Functions
+
+Base64url encoding, validation helpers, and crypto utilities. Most are used internally, but they're exported if you need them.
+
+**Encoding:**
+- `bufferToBase64url()`, `base64urlToBuffer()`
+- `uint8ArrayToBase64url()`, `base64urlToUint8Array()`
+- `arrayBufferToBase64url()`, `base64urlToArrayBuffer()`
+- `isValidBase64url()`
+
+**Validation:**
+- `validateEmail()`, `validateUuid()`, `validateRpId()`, `validateOrigin()`
+- `validatePasskeyNickname()`, `validateRecoveryCode()`, `validateBase64url()`
+- `sanitizeString()`
+
+**Cryptography:**
+- `generateRecoveryCode()` - 16 char alphanumeric code
+- `sha256Hash()` - SHA-256 hex digest
+- `hashValue()` - Bcrypt hash (async)
+- `verifyHash()` - Bcrypt verification (async)
+
+---
+
+## Type Guards
+
+Type-safe error checking. Useful when handling errors from try/catch blocks.
+
+```typescript
+import { isPasskeyError, isAuthenticationError, getErrorDetails } from '@productiongrade/passkeys';
+
+try {
+  await passkeyService.authenticate(...);
+} catch (error) {
+  if (isAuthenticationError(error)) {
+    // TypeScript knows this is AuthenticationError
+    console.log(error.code);
+  }
+  
+  const details = getErrorDetails(error);
+  if (details?.details?.troubleshooting) {
+    console.log('Help:', details.details.troubleshooting);
+  }
+}
+```
+
+Available guards:
+- `isPasskeyError()` - Any passkey error
+- `isAuthenticationError()`, `isRegistrationError()`, `isValidationError()`
+- `isUserNotFoundError()`, `isPasskeyNotFoundError()`
+- `isCounterAnomalyError()` - Detected cloned credential
+- `isRecoveryError()`, `isInvalidRecoveryCodeError()`, `isInvalidRecoveryTokenError()`
+- `isInvalidChallengeError()`
+
+`getErrorDetails()` extracts error info in a type-safe way, including troubleshooting links.
+
+---
+
+## Configuration Utilities
+
+### `validatePasskeyConfig(config: PasskeyConfig)`
+
+Validates your config and returns errors and warnings. Use this at startup to catch issues early.
+
+```typescript
+import { validatePasskeyConfig } from '@productiongrade/passkeys';
+
+const result = validatePasskeyConfig(config);
+if (!result.valid) {
+  console.error('Errors:', result.errors);
+  console.warn('Warnings:', result.warnings);
+}
+```
+
+Checks required fields, formats, storage interface methods, and optional field values.
+
+### `assertValidConfig(config: PasskeyConfig)`
+
+Throws `ValidationError` if config is invalid. Convenience wrapper around `validatePasskeyConfig`.
+
+```typescript
+import { assertValidConfig } from '@productiongrade/passkeys';
+
+assertValidConfig(config); // Throws if invalid
+```
+
+### `createPasskeyConfig(base, overrides?)`
+
+Creates config with defaults: `timeout: 60000`, `userVerification: 'preferred'`, `attestationType: 'none'`. Override any defaults as needed.
+
+```typescript
+import { createPasskeyConfig } from '@productiongrade/passkeys';
+
+const config = createPasskeyConfig({
+  rpId: 'example.com',
+  rpName: 'My App',
+  origin: 'https://example.com',
+  storage: myStorage,
+  challenges: myChallengeStorage,
+}, {
+  timeout: 120000,
+  userVerification: 'required',
+});
+```
+
+---
+
+## Debug Utilities
+
+Structured logging for debugging. Only active when `DEBUG=@productiongrade/passkeys:*` is set.
+
+```typescript
+import { debugLog, debugError } from '@productiongrade/passkeys';
+
+debugLog('PasskeyService', 'Starting registration', { userId, email });
+
+try {
+  await passkeyService.authenticate(...);
+} catch (error) {
+  debugError('PasskeyService', 'Authentication failed', error);
+}
+```
+
+Categories: `PasskeyService`, `ChallengeService`, `RecoveryService`, `Storage`, `WebAuthn`, `Config`, `Error`.
+
+---
+
+## Testing Utilities
+
+Mock storage and test fixtures. Import from `@productiongrade/passkeys/testing`.
+
+```typescript
+import { 
+  createMockStorage, 
+  createMockChallengeStorage,
+  createMockPasskeyConfig,
+  testFixtures 
+} from '@productiongrade/passkeys/testing';
+
+// Mock storage
+const storage = createMockStorage();
+const challenges = createMockChallengeStorage();
+
+// Mock config
+const config = createMockPasskeyConfig({
+  rpId: 'test.example.com',
+  rpName: 'Test App',
+});
+
+// Test data
+const user = testFixtures.createTestUser({ email: 'test@example.com' });
+const passkey = testFixtures.createTestPasskey({ userId: user.id });
+const challenge = testFixtures.createTestChallenge({ type: 'authentication' });
+```
+
+---
+
+## Next Steps
+
+- **Storage Implementation**: See [storage-adapters.mdx](./storage-adapters.mdx)
+- **React Integration**: See [react-integration.mdx](./react-integration.mdx)
+- **Migration Guide**: See [migration.mdx](./migration.mdx)
+- **Troubleshooting**: See [troubleshooting.mdx](./troubleshooting.mdx)
+- **Quick Start**: See [../README.md](../README.md)
+

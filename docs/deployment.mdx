@@ -1,0 +1,412 @@
+---
+title: Deployment
+description: Production deployment checklist and setup guide
+slug: deployment
+order: 5
+---
+
+## Pre-Deployment Checklist
+
+Before going live, verify:
+
+- [ ] HTTPS configured (required for WebAuthn)
+- [ ] `rpId` matches your production domain
+- [ ] `origin` matches your production URL exactly
+- [ ] Database migrations run
+- [ ] Challenge storage configured (Redis recommended)
+- [ ] Environment variables set
+- [ ] Error handling configured
+- [ ] Monitoring and alerting set up
+- [ ] Recovery method enabled (codes or email)
+- [ ] Security hooks configured (optional but recommended)
+
+---
+
+## Environment Setup
+
+### Required Variables
+
+```bash
+# Domain configuration
+RP_ID=yourdomain.com
+RP_NAME=Your App Name
+ORIGIN=https://yourdomain.com
+
+# Database
+DATABASE_URL=postgresql://user:pass@host:5432/dbname
+REDIS_URL=redis://host:6379
+
+# Session (if using sessions)
+SESSION_SECRET=your-secret-key-here
+```
+
+### Optional Variables
+
+```bash
+# Timeout (milliseconds)
+PASSKEY_TIMEOUT=60000
+
+# User verification
+USER_VERIFICATION=preferred
+
+# Email service (if using email recovery)
+SMTP_HOST=smtp.example.com
+SMTP_USER=user@example.com
+SMTP_PASS=password
+```
+
+---
+
+## Database Setup
+
+### Run Migrations
+
+If using Prisma:
+
+```bash
+# Generate Prisma client
+npx prisma generate
+
+# Run migrations
+npx prisma migrate deploy
+
+# Verify connection
+npx prisma db pull
+```
+
+### Verify Schema
+
+Make sure your schema matches the library's requirements:
+
+- `users` table with `email` (unique), `id`, `created_at`, `updated_at`
+- `passkeys` table with `credential_id` (unique), `user_id`, `public_key`, `counter`
+- `recovery_codes` table with `user_id`, `code_hash`, `used_at`
+- `email_recovery_tokens` table with `token_hash`, `user_id`, `expires_at`, `used_at`
+
+See [storage adapters](./storage-adapters.mdx) for reference schemas.
+
+---
+
+## Challenge Storage Setup
+
+Use Redis in production. Memory storage doesn't work with multiple servers.
+
+### Redis Configuration
+
+```typescript
+import { createClient } from 'redis';
+import { RedisChallengeStorage } from '@productiongrade/passkeys/adapters/redis';
+
+const redis = createClient({
+  url: process.env.REDIS_URL,
+});
+
+await redis.connect();
+
+const challenges = new RedisChallengeStorage(redis);
+```
+
+### Redis TTL
+
+Challenges expire after 5 minutes. Redis handles this automatically with TTL. Make sure your Redis instance supports TTL.
+
+---
+
+## HTTPS Configuration
+
+WebAuthn requires HTTPS (except localhost). Set up SSL certificates:
+
+### Using Let's Encrypt
+
+```bash
+# Install certbot
+sudo apt install certbot
+
+# Get certificate
+sudo certbot certonly --standalone -d yourdomain.com
+
+# Certificates stored in /etc/letsencrypt/live/yourdomain.com/
+```
+
+### Using Your Hosting Provider
+
+Most providers (Vercel, Railway, Render, etc.) handle HTTPS automatically. Just make sure your `origin` uses `https://`.
+
+---
+
+## Monitoring Setup
+
+### Health Checks
+
+Add a health check endpoint:
+
+```typescript
+app.get('/health', async (req, res) => {
+  const checks = {
+    database: false,
+    redis: false,
+  };
+  
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    checks.database = true;
+  } catch (error) {
+    console.error('Database health check failed:', error);
+  }
+  
+  try {
+    await redis.ping();
+    checks.redis = true;
+  } catch (error) {
+    console.error('Redis health check failed:', error);
+  }
+  
+  const healthy = checks.database && checks.redis;
+  res.status(healthy ? 200 : 503).json({ checks });
+});
+```
+
+### Metrics to Track
+
+- Authentication success rate
+- Registration success rate
+- Counter anomalies (security events)
+- Challenge expiration rate
+- Recovery code usage
+- Error rates by type
+- Response times
+
+### Logging
+
+Set up structured logging:
+
+```typescript
+import winston from 'winston';
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.json(),
+  transports: [
+    new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'combined.log' }),
+  ],
+});
+
+// Use in hooks
+hooks: {
+  onAuthFailure: async (email, error) => {
+    logger.error('Authentication failed', {
+      email,
+      error: error.message,
+      code: error.code,
+    });
+  },
+}
+```
+
+---
+
+## Security Hooks
+
+Configure security monitoring:
+
+```typescript
+const { router } = createPasskeys({
+  // ... config
+  hooks: {
+    onCounterAnomaly: async (userId, passkeyId, expected, received) => {
+      // Log security event
+      await securityLog.create({
+        type: 'COUNTER_ANOMALY',
+        userId,
+        passkeyId,
+        expected,
+        received,
+        timestamp: new Date(),
+      });
+      
+      // Alert security team
+      await sendAlert({
+        severity: 'high',
+        message: `Counter anomaly for user ${userId}`,
+      });
+    },
+    
+    onAuthFailure: async (email, error) => {
+      // Track failed attempts for rate limiting
+      await rateLimiter.recordFailure(email);
+    },
+  },
+});
+```
+
+---
+
+## Error Handling
+
+Use the built-in error handler:
+
+```typescript
+import { errorHandler } from '@productiongrade/passkeys/express';
+
+app.use('/api/auth', router);
+app.use(errorHandler); // Mount last
+```
+
+This converts all errors to RFC 7807 Problem Details format.
+
+For custom error handling:
+
+```typescript
+app.use((err, req, res, next) => {
+  if (err instanceof PasskeyError) {
+    res.status(err.statusCode).json(err.toProblemDetails());
+  } else {
+    // Handle other errors
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+```
+
+---
+
+## Rate Limiting
+
+Add rate limiting to prevent abuse:
+
+```typescript
+import rateLimit from 'express-rate-limit';
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 attempts
+  message: 'Too many attempts, please try again later',
+});
+
+app.use('/api/auth/authenticate', authLimiter);
+app.use('/api/auth/register', authLimiter);
+```
+
+---
+
+## Session Management
+
+### Cookie-Based Sessions
+
+```typescript
+import session from 'express-session';
+import RedisStore from 'connect-redis';
+
+app.use(session({
+  store: new RedisStore({ client: redis }),
+  secret: process.env.SESSION_SECRET!,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: true,      // HTTPS only
+    httpOnly: true,    // No JS access
+    sameSite: 'strict',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  },
+}));
+```
+
+### JWT Tokens
+
+```typescript
+import jwt from 'jsonwebtoken';
+
+// After successful auth
+const token = jwt.sign(
+  { userId: user.id },
+  process.env.JWT_SECRET!,
+  { expiresIn: '7d' }
+);
+
+res.json({ token });
+```
+
+---
+
+## Multi-Region Deployment
+
+If deploying across multiple regions:
+
+1. **Database**: Use a global database or replication
+2. **Redis**: Use Redis Cluster or managed Redis with replication
+3. **Sessions**: Use shared session store (Redis)
+4. **Challenges**: Must be accessible from all regions (Redis Cluster)
+
+Challenges are time-sensitive (5-minute TTL), so low latency to Redis is important.
+
+---
+
+## Rollback Plan
+
+If something goes wrong:
+
+1. **Revert code**: Deploy previous version
+2. **Check database**: Verify schema hasn't changed
+3. **Check Redis**: Clear expired challenges if needed
+4. **Monitor logs**: Check for errors
+5. **Disable feature**: Temporarily disable passkey auth if needed
+
+Keep the previous version's database schema compatible for easy rollback.
+
+---
+
+## Post-Deployment
+
+After deploying:
+
+1. **Test registration**: Register a new passkey
+2. **Test authentication**: Sign in with the passkey
+3. **Test recovery**: Try recovery code or email recovery
+4. **Check monitoring**: Verify metrics are being collected
+5. **Check logs**: Look for errors or warnings
+6. **Monitor for 24 hours**: Watch for issues
+
+---
+
+## Common Deployment Issues
+
+### "Origin mismatch" in Production
+
+Check that `origin` matches your actual URL exactly, including protocol:
+
+```typescript
+// ❌ Wrong
+origin: 'https://www.example.com'  // If actual URL is https://example.com
+
+// ✅ Correct
+origin: 'https://example.com'  // Match exactly
+```
+
+### Challenges Not Working
+
+Redis connection issues or TTL not configured. Test Redis:
+
+```typescript
+await redis.set('test', 'value', { EX: 300 }); // 5 min TTL
+const value = await redis.get('test');
+console.log('Redis test:', value); // Should print 'value'
+```
+
+### Database Connection Errors
+
+Check connection string and network access:
+
+```typescript
+await prisma.$connect();
+console.log('Database connected');
+```
+
+---
+
+## Next Steps
+
+- [Best Practices](./best-practices.mdx) - Security and performance
+- [Troubleshooting](./troubleshooting.mdx) - Common issues
+- [Configuration](./configuration.mdx) - All config options
+- [API Reference](./api-reference.mdx) - Complete API docs
+

@@ -1,0 +1,507 @@
+---
+title: Patterns & Recipes
+description: Real-world patterns for common scenarios
+slug: patterns
+order: 8
+---
+
+## Multi-Tenant Setup
+
+Support multiple organizations with separate passkey storage:
+
+```typescript
+import { PasskeyService } from '@productiongrade/passkeys';
+
+// Create service per tenant
+const tenantServices = new Map<string, PasskeyService>();
+
+function getServiceForTenant(tenantId: string): PasskeyService {
+  if (!tenantServices.has(tenantId)) {
+    const storage = new PrismaAdapter(prisma, {
+      // Scope queries to tenant
+      where: { tenantId },
+    });
+    
+    tenantServices.set(tenantId, new PasskeyService(storage, {
+      rpId: `${tenantId}.example.com`, // Tenant-specific RP ID
+      rpName: `Tenant ${tenantId}`,
+      origin: `https://${tenantId}.example.com`,
+      storage,
+    }));
+  }
+  
+  return tenantServices.get(tenantId)!;
+}
+
+// Use in routes
+app.post('/api/:tenantId/auth/register/start', async (req, res) => {
+  const service = getServiceForTenant(req.params.tenantId);
+  const { options, userId } = await service.generateRegistrationOptions(req.body.email);
+  res.json({ options, userId });
+});
+```
+
+---
+
+## Role-Based Access Control
+
+Add roles to users and check them in protected routes:
+
+```typescript
+// Extend user model
+interface User {
+  id: string;
+  email: string;
+  role: 'admin' | 'user' | 'moderator';
+}
+
+// Middleware to check roles
+function requireRole(...allowedRoles: string[]) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    if (!allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    next();
+  };
+}
+
+// Use in routes
+app.get('/api/admin/users', 
+  middleware.requireAuth,
+  requireRole('admin'),
+  async (req, res) => {
+    const users = await storage.getAllUsers();
+    res.json(users);
+  }
+);
+```
+
+---
+
+## Session Management
+
+### Cookie-Based Sessions
+
+```typescript
+import session from 'express-session';
+import RedisStore from 'connect-redis';
+
+app.use(session({
+  store: new RedisStore({ client: redis }),
+  secret: process.env.SESSION_SECRET!,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: true,
+    httpOnly: true,
+    sameSite: 'strict',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  },
+}));
+
+// After successful auth
+app.post('/api/auth/authenticate/finish', async (req, res) => {
+  const result = await handlers.finishAuthentication(req, res);
+  if (result.success) {
+    req.session.userId = result.data.user.id;
+    req.session.save();
+  }
+  res.json(result);
+});
+
+// Protected route
+app.get('/api/profile', (req, res) => {
+  if (!req.session.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  // User is authenticated
+});
+```
+
+### JWT Tokens
+
+```typescript
+import jwt from 'jsonwebtoken';
+
+// After successful auth
+const token = jwt.sign(
+  { userId: user.id, email: user.email },
+  process.env.JWT_SECRET!,
+  { expiresIn: '7d' }
+);
+
+res.json({ token, user });
+
+// Middleware to verify JWT
+function requireAuth(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET!);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+```
+
+---
+
+## Account Linking
+
+Link passkeys with OAuth accounts:
+
+```typescript
+// After OAuth login
+app.get('/api/auth/oauth/callback', async (req, res) => {
+  const oauthUser = await verifyOAuthToken(req.query.code);
+  
+  // Check if user exists by email
+  let user = await storage.getUserByEmail(oauthUser.email);
+  
+  if (!user) {
+    // Create new user
+    user = await storage.createUser({ email: oauthUser.email });
+  }
+  
+  // Link OAuth account
+  await linkOAuthAccount(user.id, oauthUser.provider, oauthUser.providerId);
+  
+  // User can now use either OAuth or passkey
+  req.session.userId = user.id;
+  res.redirect('/dashboard');
+});
+
+// Check if user has passkey
+app.get('/api/user/auth-methods', middleware.requireAuth, async (req, res) => {
+  const user = await storage.getUserById(req.user.id);
+  const passkeys = await storage.getUserPasskeys(user.id);
+  const oauthAccounts = await getOAuthAccounts(user.id);
+  
+  res.json({
+    hasPasskey: passkeys.length > 0,
+    hasOAuth: oauthAccounts.length > 0,
+    methods: [
+      ...(passkeys.length > 0 ? ['passkey'] : []),
+      ...oauthAccounts.map(a => a.provider),
+    ],
+  });
+});
+```
+
+---
+
+## Progressive Enhancement
+
+Support both passwords and passkeys, with passkeys as preferred:
+
+```typescript
+// Login endpoint supports both
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password, credential } = req.body;
+  
+  if (credential) {
+    // Passkey authentication
+    const result = await handlers.finishAuthentication(req, res);
+    if (result.success) {
+      req.session.userId = result.data.user.id;
+      return res.json({ method: 'passkey', user: result.data.user });
+    }
+  } else if (password) {
+    // Password authentication (legacy)
+    const user = await verifyPassword(email, password);
+    if (user) {
+      req.session.userId = user.id;
+      return res.json({ method: 'password', user });
+    }
+  }
+  
+  res.status(401).json({ error: 'Invalid credentials' });
+});
+```
+
+Frontend:
+
+```tsx
+function LoginForm() {
+  const [method, setMethod] = useState<'passkey' | 'password'>('passkey');
+  const { authenticate } = usePasskeyAuth({ apiUrl: '/api/auth' });
+  
+  const handlePasskeyLogin = () => authenticate();
+  
+  const handlePasswordLogin = async (email, password) => {
+    await fetch('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+  };
+  
+  return (
+    <div>
+      {method === 'passkey' ? (
+        <button onClick={handlePasskeyLogin}>Sign in with Passkey</button>
+      ) : (
+        <form onSubmit={(e) => {
+          e.preventDefault();
+          handlePasswordLogin(email, password);
+        }}>
+          <input type="email" />
+          <input type="password" />
+          <button>Sign in with Password</button>
+        </form>
+      )}
+      <a onClick={() => setMethod(method === 'passkey' ? 'password' : 'passkey')}>
+        Use {method === 'passkey' ? 'password' : 'passkey'} instead
+      </a>
+    </div>
+  );
+}
+```
+
+---
+
+## Email Verification
+
+Require email verification before allowing passkey registration:
+
+```typescript
+// Step 1: Send verification email
+app.post('/api/auth/verify-email/send', async (req, res) => {
+  const { email } = req.body;
+  const token = generateVerificationToken(email);
+  
+  await sendEmail(email, {
+    subject: 'Verify your email',
+    html: `<a href="https://example.com/verify?token=${token}">Verify Email</a>`,
+  });
+  
+  // Store token (expires in 24 hours)
+  await redis.set(`verify:${token}`, email, { EX: 24 * 60 * 60 });
+  
+  res.json({ success: true });
+});
+
+// Step 2: Verify token
+app.get('/api/auth/verify-email', async (req, res) => {
+  const { token } = req.query;
+  const email = await redis.get(`verify:${token}`);
+  
+  if (!email) {
+    return res.status(400).json({ error: 'Invalid or expired token' });
+  }
+  
+  // Mark email as verified
+  await storage.markEmailVerified(email);
+  await redis.del(`verify:${token}`);
+  
+  res.json({ success: true, email });
+});
+
+// Step 3: Only allow registration for verified emails
+app.post('/api/auth/register/start', async (req, res) => {
+  const { email } = req.body;
+  const user = await storage.getUserByEmail(email);
+  
+  if (user && !user.emailVerified) {
+    return res.status(400).json({
+      error: 'Email not verified',
+      action: 'verify-email',
+    });
+  }
+  
+  // Continue with registration
+  const { options, userId } = await service.generateRegistrationOptions(email);
+  res.json({ options, userId });
+});
+```
+
+---
+
+## Passkey Management UI
+
+Let users manage their passkeys:
+
+```tsx
+import { usePasskeyManagement } from '@productiongrade/passkeys/react';
+
+function PasskeySettings() {
+  const { passkeys, updateNickname, deletePasskey, refresh } = usePasskeyManagement({
+    apiUrl: '/api/auth',
+    authToken: getSessionToken(),
+  });
+  
+  return (
+    <div>
+      <h2>Your Passkeys</h2>
+      {passkeys?.map((passkey) => (
+        <div key={passkey.id}>
+          <div>
+            <strong>{passkey.nickname || 'Unnamed Device'}</strong>
+            <span>{passkey.deviceType === 'multiDevice' ? '🔐 Synced' : '📱 Device'}</span>
+          </div>
+          <div>
+            Created: {new Date(passkey.createdAt).toLocaleDateString()}
+            {passkey.lastUsedAt && (
+              <> • Last used: {new Date(passkey.lastUsedAt).toLocaleDateString()}</>
+            )}
+          </div>
+          <div>
+            <input
+              defaultValue={passkey.nickname || ''}
+              onBlur={(e) => updateNickname(passkey.id, e.target.value)}
+              placeholder="Device name"
+            />
+            <button onClick={() => deletePasskey(passkey.id)}>
+              Delete
+            </button>
+          </div>
+        </div>
+      ))}
+      <button onClick={refresh}>Refresh</button>
+    </div>
+  );
+}
+```
+
+---
+
+## Two-Factor Authentication
+
+Use passkeys as a second factor:
+
+```typescript
+// Step 1: User logs in with password
+app.post('/api/auth/password/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await verifyPassword(email, password);
+  
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  
+  // Check if user has 2FA enabled
+  const hasPasskey = await storage.getUserPasskeys(user.id).then(p => p.length > 0);
+  
+  if (hasPasskey) {
+    // Require passkey as second factor
+    const { options } = await service.generateAuthenticationOptions(email);
+    req.session.tempUserId = user.id; // Store temporarily
+    return res.json({ requires2FA: true, options });
+  }
+  
+  // No 2FA, login complete
+  req.session.userId = user.id;
+  res.json({ requires2FA: false, user });
+});
+
+// Step 2: Verify passkey (second factor)
+app.post('/api/auth/2fa/verify', async (req, res) => {
+  const { credential } = req.body;
+  const tempUserId = req.session.tempUserId;
+  
+  if (!tempUserId) {
+    return res.status(400).json({ error: 'No pending 2FA' });
+  }
+  
+  // Verify passkey
+  const result = await service.verifyAuthentication(credential);
+  
+  if (result.success && result.data.user.id === tempUserId) {
+    // 2FA successful
+    req.session.userId = tempUserId;
+    delete req.session.tempUserId;
+    res.json({ success: true, user: result.data.user });
+  } else {
+    res.status(401).json({ error: '2FA verification failed' });
+  }
+});
+```
+
+---
+
+## Account Recovery Flow
+
+Complete recovery flow with email and codes:
+
+```typescript
+// Recovery options page
+app.get('/api/auth/recovery/options', async (req, res) => {
+  const { email } = req.query;
+  const user = await storage.getUserByEmail(email as string);
+  
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+  
+  const hasRecoveryCodes = await storage.hasRecoveryCodes(user.id);
+  const hasEmail = user.email; // Assuming email is verified
+  
+  res.json({
+    email,
+    methods: [
+      ...(hasRecoveryCodes ? ['codes'] : []),
+      ...(hasEmail ? ['email'] : []),
+    ],
+  });
+});
+
+// Recovery code verification
+app.post('/api/auth/recovery/codes/verify', async (req, res) => {
+  const { email, code } = req.body;
+  const user = await storage.getUserByEmail(email);
+  
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+  
+  const valid = await recoveryService.verifyRecoveryCode(user.id, code);
+  
+  if (valid) {
+    // Create temporary session for account recovery
+    const recoveryToken = generateRecoveryToken(user.id);
+    await redis.set(`recovery:${recoveryToken}`, user.id, { EX: 3600 }); // 1 hour
+    
+    res.json({ recoveryToken });
+  } else {
+    res.status(401).json({ error: 'Invalid recovery code' });
+  }
+});
+
+// Complete recovery (reset passkeys, etc.)
+app.post('/api/auth/recovery/complete', async (req, res) => {
+  const { recoveryToken } = req.body;
+  const userId = await redis.get(`recovery:${recoveryToken}`);
+  
+  if (!userId) {
+    return res.status(400).json({ error: 'Invalid or expired token' });
+  }
+  
+  // Delete all existing passkeys (user needs to re-register)
+  await storage.deleteAllUserPasskeys(userId);
+  await redis.del(`recovery:${recoveryToken}`);
+  
+  // Create new session
+  req.session.userId = userId;
+  
+  res.json({ success: true, message: 'Account recovered. Please register a new passkey.' });
+});
+```
+
+---
+
+## Next Steps
+
+- [Examples](./examples.mdx) - More code examples
+- [Best Practices](./best-practices.mdx) - Security and performance
+- [API Reference](./api-reference.mdx) - Complete API docs
+- [Migration Guide](./migration.mdx) - Migrating from passwords
+

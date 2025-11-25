@@ -1,0 +1,460 @@
+---
+title: Error Handling
+description: Error types, handling patterns, and recovery strategies
+slug: error-handling
+order: 7
+---
+
+## Error Types
+
+The library throws specific error types you can catch and handle:
+
+### AuthenticationError
+
+Thrown when authentication fails:
+
+```typescript
+import { isAuthenticationError } from '@productiongrade/passkeys';
+
+try {
+  await passkeyService.verifyAuthentication(credential);
+} catch (error) {
+  if (isAuthenticationError(error)) {
+    // Authentication failed
+    console.error('Auth failed:', error.message);
+    // error.code: 'AUTHENTICATION_FAILED'
+    // error.statusCode: 401
+  }
+}
+```
+
+**Common causes:**
+- Invalid credential
+- Challenge expired
+- Origin mismatch
+- Browser doesn't support WebAuthn
+
+### RegistrationError
+
+Thrown when registration fails:
+
+```typescript
+import { isRegistrationError } from '@productiongrade/passkeys';
+
+try {
+  await passkeyService.verifyRegistration(userId, credential);
+} catch (error) {
+  if (isRegistrationError(error)) {
+    // Registration failed
+    console.error('Registration failed:', error.message);
+  }
+}
+```
+
+**Common causes:**
+- Invalid credential
+- Challenge expired
+- User verification failed
+- RP ID mismatch
+
+### ValidationError
+
+Thrown for invalid input:
+
+```typescript
+import { isValidationError } from '@productiongrade/passkeys';
+
+try {
+  await passkeyService.generateRegistrationOptions('invalid-email');
+} catch (error) {
+  if (isValidationError(error)) {
+    // Invalid input
+    console.error('Validation error:', error.message);
+  }
+}
+```
+
+**Common causes:**
+- Invalid email format
+- Missing required fields
+- Invalid UUID
+- Invalid configuration
+
+### CounterAnomalyError
+
+Thrown when signature counter goes backwards (possible cloned credential):
+
+```typescript
+import { isCounterAnomalyError } from '@productiongrade/passkeys';
+
+try {
+  await passkeyService.verifyAuthentication(credential);
+} catch (error) {
+  if (isCounterAnomalyError(error)) {
+    // Security issue - counter went backwards
+    console.error('Counter anomaly:', error.message);
+    // error.details: { expected: 5, received: 3 }
+    
+    // Log security event
+    await securityLog.create({
+      type: 'COUNTER_ANOMALY',
+      userId: error.details.userId,
+    });
+  }
+}
+```
+
+**What it means:** The credential's counter decreased, which shouldn't happen. Possible causes:
+- Credential was cloned
+- Authenticator malfunction
+- Test authenticator bug (in development)
+
+### InvalidChallengeError
+
+Thrown when challenge is missing or expired:
+
+```typescript
+import { isInvalidChallengeError } from '@productiongrade/passkeys';
+
+try {
+  await challengeService.verify(clientDataJSON);
+} catch (error) {
+  if (isInvalidChallengeError(error)) {
+    // Challenge expired or not found
+    console.error('Challenge invalid:', error.message);
+  }
+}
+```
+
+**Common causes:**
+- Challenge expired (5 minutes)
+- Challenge already used
+- Challenge not found in storage
+- Clock skew between client/server
+
+### PasskeyNotFoundError
+
+Thrown when passkey doesn't exist:
+
+```typescript
+import { isPasskeyNotFoundError } from '@productiongrade/passkeys';
+
+try {
+  await passkeyService.verifyAuthentication(credential);
+} catch (error) {
+  if (isPasskeyNotFoundError(error)) {
+    // Passkey not found
+    console.error('Passkey not found:', error.message);
+  }
+}
+```
+
+**Common causes:**
+- User hasn't registered
+- Passkey was deleted
+- Wrong credential ID
+
+---
+
+## Error Handling Patterns
+
+### Type-Safe Error Handling
+
+Use type guards for type-safe error handling:
+
+```typescript
+import {
+  isAuthenticationError,
+  isRegistrationError,
+  isValidationError,
+  isCounterAnomalyError,
+  getErrorDetails,
+} from '@productiongrade/passkeys';
+
+try {
+  await passkeyService.verifyAuthentication(credential);
+} catch (error) {
+  if (isAuthenticationError(error)) {
+    // Handle auth failure
+    res.status(401).json({
+      error: 'Authentication failed',
+      message: error.message,
+    });
+  } else if (isCounterAnomalyError(error)) {
+    // Security alert
+    await handleSecurityAlert(error);
+    res.status(401).json({
+      error: 'Security issue detected',
+    });
+  } else {
+    // Unknown error
+    const details = getErrorDetails(error);
+    logger.error('Unexpected error', details);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+```
+
+### User-Friendly Messages
+
+Don't expose internal errors to users:
+
+```typescript
+try {
+  await passkeyService.verifyAuthentication(credential);
+} catch (error) {
+  if (isAuthenticationError(error)) {
+    // Generic message for user
+    res.status(401).json({
+      error: 'Sign in failed. Please try again.',
+    });
+    
+    // Log details server-side
+    logger.error('Authentication failed', {
+      error: error.message,
+      code: error.code,
+      details: error.details,
+    });
+  }
+}
+```
+
+### Error Recovery
+
+Provide recovery options:
+
+```typescript
+try {
+  await passkeyService.verifyAuthentication(credential);
+} catch (error) {
+  if (isPasskeyNotFoundError(error)) {
+    // User might need to register
+    res.status(404).json({
+      error: 'No passkey found',
+      suggestion: 'Please register a passkey first',
+      action: 'register',
+    });
+  } else if (isInvalidChallengeError(error)) {
+    // Challenge expired - user can retry
+    res.status(400).json({
+      error: 'Challenge expired',
+      suggestion: 'Please try again',
+      action: 'retry',
+    });
+  }
+}
+```
+
+---
+
+## Error Details
+
+Errors include troubleshooting information:
+
+```typescript
+import { getErrorDetails } from '@productiongrade/passkeys';
+
+try {
+  await passkeyService.verifyAuthentication(credential);
+} catch (error) {
+  const details = getErrorDetails(error);
+  
+  if (details.troubleshooting) {
+    console.log('Help:', details.troubleshooting);
+  }
+  
+  if (details.details?.commonCauses) {
+    console.log('Common causes:', details.details.commonCauses);
+  }
+  
+  if (details.details?.solutions) {
+    console.log('Solutions:', details.details.solutions);
+  }
+}
+```
+
+---
+
+## Express Error Handler
+
+Use the built-in error handler:
+
+```typescript
+import { errorHandler } from '@productiongrade/passkeys/express';
+
+app.use('/api/auth', router);
+app.use(errorHandler); // Converts errors to RFC 7807 format
+```
+
+This automatically converts all `PasskeyError` instances to RFC 7807 Problem Details format.
+
+### Custom Error Handler
+
+For more control:
+
+```typescript
+import { PasskeyError } from '@productiongrade/passkeys';
+
+app.use((err, req, res, next) => {
+  if (err instanceof PasskeyError) {
+    res.status(err.statusCode).json(err.toProblemDetails());
+  } else {
+    // Handle other errors
+    res.status(500).json({
+      type: 'https://example.com/errors/internal-error',
+      title: 'Internal Server Error',
+      status: 500,
+      detail: 'An unexpected error occurred',
+    });
+  }
+});
+```
+
+---
+
+## React Error Handling
+
+Handle errors in React hooks:
+
+```tsx
+import { usePasskeyAuth } from '@productiongrade/passkeys/react';
+import { isAuthenticationError, isValidationError } from '@productiongrade/passkeys';
+
+function LoginForm() {
+  const { authenticate, error } = usePasskeyAuth({
+    apiUrl: '/api/auth',
+    onError: (error) => {
+      if (isAuthenticationError(error)) {
+        setMessage('Sign in failed. Please try again.');
+      } else if (isValidationError(error)) {
+        setMessage('Invalid email address.');
+      } else {
+        setMessage('Something went wrong. Please try again.');
+      }
+    },
+  });
+
+  return (
+    <div>
+      <button onClick={() => authenticate('user@example.com')}>
+        Sign In
+      </button>
+      {error && <div className="error">{error.message}</div>}
+    </div>
+  );
+}
+```
+
+---
+
+## Logging Errors
+
+Log errors with context:
+
+```typescript
+hooks: {
+  onAuthFailure: async (email, error) => {
+    await logger.error('Authentication failed', {
+      email,
+      error: error.message,
+      code: error.code,
+      statusCode: error.statusCode,
+      details: error.details,
+      stack: error.stack,
+      timestamp: new Date().toISOString(),
+    });
+  },
+  
+  onCounterAnomaly: async (userId, passkeyId, expected, received) => {
+    await logger.warn('Counter anomaly detected', {
+      userId,
+      passkeyId,
+      expected,
+      received,
+      severity: 'high',
+      timestamp: new Date().toISOString(),
+    });
+  },
+}
+```
+
+---
+
+## Error Response Format
+
+All errors return RFC 7807 Problem Details:
+
+```json
+{
+  "type": "https://castellan.dev/errors/authentication-failed",
+  "title": "AuthenticationError",
+  "status": 401,
+  "detail": "Authentication verification failed",
+  "troubleshooting": "https://castellan.dev/docs/troubleshooting#authentication-failed",
+  "commonCauses": [
+    "Browser doesn't support WebAuthn",
+    "HTTPS required in production"
+  ],
+  "solutions": [
+    "Use a modern browser",
+    "Ensure HTTPS is enabled"
+  ]
+}
+```
+
+---
+
+## Common Error Scenarios
+
+### User Cancels WebAuthn Prompt
+
+This isn't an error—the user just dismissed the prompt. Handle it gracefully:
+
+```typescript
+try {
+  await authenticate();
+} catch (error) {
+  if (error.message.includes('user cancelled') || error.code === 'USER_CANCELLED') {
+    // User cancelled - not an error
+    return;
+  }
+  // Handle actual errors
+}
+```
+
+### Challenge Expired
+
+User took too long. Let them retry:
+
+```typescript
+if (isInvalidChallengeError(error)) {
+  setMessage('Session expired. Please try again.');
+  // Automatically retry or show retry button
+}
+```
+
+### Counter Anomaly
+
+Security issue detected. Log and alert:
+
+```typescript
+if (isCounterAnomalyError(error)) {
+  await securityAlert.send({
+    userId: error.details.userId,
+    passkeyId: error.details.passkeyId,
+    severity: 'high',
+  });
+  
+  // Optionally lock account or require re-verification
+  await lockUserAccount(error.details.userId);
+}
+```
+
+---
+
+## Next Steps
+
+- [Troubleshooting](./troubleshooting.mdx) - Common issues and fixes
+- [API Reference](./api-reference.mdx) - Error class details
+- [Best Practices](./best-practices.mdx) - Error handling recommendations
+

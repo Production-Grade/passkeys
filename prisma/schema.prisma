@@ -1,0 +1,79 @@
+// Prisma Schema for Passkeys Authentication Library
+// This is a reference implementation showing the data model
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// User account
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  passkeys            Passkey[]
+  recoveryCodes       RecoveryCode[]
+  emailRecoveryTokens EmailRecoveryToken[]
+
+  @@index([email])
+}
+
+// WebAuthn credential
+model Passkey {
+  id         String    @id // WebAuthn credential ID (base64url-encoded)
+  userId     String
+  publicKey  String    // Base64url-encoded public key
+  counter    Int       @default(0)
+  transports String[]  // e.g., ["usb", "nfc", "ble", "internal"]
+  deviceType String    // "singleDevice" or "multiDevice"
+  backedUp   Boolean   @default(false)
+  nickname   String?
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, lastUsedAt])
+}
+
+// One-time recovery codes
+model RecoveryCode {
+  id        String    @id @default(uuid())
+  userId    String
+  codeHash  String    // bcrypt hash of the recovery code
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, usedAt]) // For finding unused codes
+}
+
+// Email recovery tokens
+model EmailRecoveryToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    // SHA-256 hash of the token
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@index([usedAt, expiresAt]) // For finding valid tokens
+}
+

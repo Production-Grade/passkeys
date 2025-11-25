@@ -1,0 +1,761 @@
+---
+title: React Integration
+description: React hooks for @productiongrade/passkeys - build passkey authentication UI in minutes
+slug: react-integration
+order: 2
+---
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Hooks](#hooks)
+  - [usePasskeyRegistration](#usepasskeyregistration)
+  - [usePasskeyAuth](#usepasskeyauth)
+  - [usePasskeyManagement](#usepasskeymanagement)
+- [Utility Functions](#utility-functions)
+- [Error Handling](#error-handling)
+- [TypeScript](#typescript)
+- [Examples](#examples)
+
+---
+
+## Installation
+
+```bash
+npm install @productiongrade/passkeys react @simplewebauthn/browser
+```
+
+**Peer Dependencies:**
+- `react` >= 18.0.0
+- `@simplewebauthn/browser` ^9.0.0
+
+---
+
+## Quick Start
+
+```tsx
+import { usePasskeyRegistration, usePasskeyAuth } from '@productiongrade/passkeys/react';
+
+function LoginPage() {
+  const { register, isLoading, error } = usePasskeyRegistration({
+    apiUrl: '/auth',
+    onSuccess: (user, passkey) => {
+      console.log('Registered!', user);
+    },
+  });
+
+  const { authenticate } = usePasskeyAuth({
+    apiUrl: '/auth',
+    onSuccess: (user) => {
+      console.log('Authenticated!', user);
+    },
+  });
+
+  return (
+    <div>
+      <button onClick={() => register('user@example.com')} disabled={isLoading}>
+        {isLoading ? 'Creating passkey...' : 'Register with Passkey'}
+      </button>
+
+      <button onClick={() => authenticate('user@example.com')}>
+        Sign in with Passkey
+      </button>
+
+      {error && <p className="error">{error.message}</p>}
+    </div>
+  );
+}
+```
+
+---
+
+## Hooks
+
+### usePasskeyRegistration
+
+Handles the complete registration flow: WebAuthn check, API calls, and error handling.
+
+#### Usage
+
+```tsx
+import { usePasskeyRegistration } from '@productiongrade/passkeys/react';
+
+function RegisterForm() {
+  const { register, isLoading, error, reset } = usePasskeyRegistration({
+    apiUrl: '/auth',
+    onSuccess: (user, passkey) => {
+      // Handle successful registration
+      navigate('/dashboard');
+    },
+    onError: (error) => {
+      // Handle error
+      console.error('Registration failed:', error);
+    },
+  });
+
+  const handleRegister = async () => {
+    await register('user@example.com');
+  };
+
+  return (
+    <div>
+      <button onClick={handleRegister} disabled={isLoading}>
+        {isLoading ? 'Creating Passkey...' : 'Register'}
+      </button>
+      {error && (
+        <div className="error">
+          {error.message}
+          <button onClick={reset}>Try Again</button>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+**Config:**
+```typescript
+interface UsePasskeyRegistrationConfig {
+  apiUrl: string;
+  onSuccess?: (user: User, passkey: Passkey) => void;
+  onError?: (error: PasskeyError) => void;
+}
+```
+
+**Returns:**
+```typescript
+interface UsePasskeyRegistrationReturn {
+  register: (email: string) => Promise<void>;
+  isLoading: boolean;
+  error: PasskeyError | null;
+  reset: () => void;
+}
+```
+
+**Required endpoints:**
+- `POST ${apiUrl}/register/start` - Body: `{ email: string }`
+- `POST ${apiUrl}/register/finish` - Body: `{ userId: string, credential: RegistrationResponseJSON }`
+
+---
+
+### usePasskeyAuth
+
+Handles authentication. Pass an email to filter to that user's passkeys, or omit it for autofill UI.
+
+#### Usage
+
+```tsx
+import { usePasskeyAuth } from '@productiongrade/passkeys/react';
+
+function LoginForm() {
+  const { authenticate, isLoading, error } = usePasskeyAuth({
+    apiUrl: '/auth',
+    onSuccess: (user) => {
+      localStorage.setItem('userId', user.id);
+      navigate('/dashboard');
+    },
+  });
+
+  return (
+    <div>
+      {/* Sign in with specific email */}
+      <button 
+        onClick={() => authenticate('user@example.com')} 
+        disabled={isLoading}
+      >
+        Sign In with Passkey
+      </button>
+
+      {/* Or use autofill/conditional UI */}
+      <button 
+        onClick={() => authenticate()} 
+        disabled={isLoading}
+      >
+        Sign In with Any Passkey
+      </button>
+
+      {error && <p className="error">{error.message}</p>}
+    </div>
+  );
+}
+```
+
+**Config:**
+```typescript
+interface UsePasskeyAuthConfig {
+  apiUrl: string;
+  onSuccess?: (user: User) => void;
+  onError?: (error: PasskeyError) => void;
+}
+```
+
+**Returns:**
+```typescript
+interface UsePasskeyAuthReturn {
+  authenticate: (email?: string) => Promise<void>;
+  isLoading: boolean;
+  error: PasskeyError | null;
+  reset: () => void;
+}
+```
+
+**Required endpoints:**
+- `POST ${apiUrl}/authenticate/start` - Body: `{ email?: string }`
+- `POST ${apiUrl}/authenticate/finish` - Body: `{ credential: AuthenticationResponseJSON }`
+
+---
+
+### usePasskeyManagement
+
+Lists, renames, and deletes passkeys. Requires authentication token.
+
+#### Usage
+
+```tsx
+import { usePasskeyManagement } from '@productiongrade/passkeys/react';
+
+function PasskeySettings() {
+  const {
+    passkeys,
+    isLoading,
+    error,
+    refresh,
+    updateNickname,
+    deletePasskey,
+  } = usePasskeyManagement({
+    apiUrl: '/auth',
+    authToken: localStorage.getItem('authToken'),
+  });
+
+  return (
+    <div>
+      <h2>Your Passkeys</h2>
+      {isLoading && <p>Loading...</p>}
+      {error && <p className="error">{error.message}</p>}
+
+      <ul>
+        {passkeys?.map((passkey) => (
+          <li key={passkey.id}>
+            <input
+              value={passkey.nickname || 'Unnamed'}
+              onChange={(e) => updateNickname(passkey.id, e.target.value)}
+            />
+            <span>{passkey.deviceType}</span>
+            <span>{new Date(passkey.createdAt).toLocaleDateString()}</span>
+            <button onClick={() => deletePasskey(passkey.id)}>
+              Delete
+            </button>
+          </li>
+        ))}
+      </ul>
+
+      <button onClick={refresh}>Refresh</button>
+    </div>
+  );
+}
+```
+
+#### Configuration
+
+```typescript
+interface UsePasskeyManagementConfig {
+  apiUrl: string;
+  authToken?: string;                          // Optional: Bearer token for auth
+  onSuccess?: () => void;
+  onError?: (error: PasskeyError) => void;
+}
+```
+
+#### Return Value
+
+```typescript
+interface UsePasskeyManagementReturn {
+  passkeys: Passkey[] | null;
+  isLoading: boolean;
+  error: PasskeyError | null;
+  refresh: () => Promise<void>;
+  updateNickname: (passkeyId: string, nickname: string) => Promise<void>;
+  deletePasskey: (passkeyId: string) => Promise<void>;
+}
+```
+
+#### API Endpoints Required
+
+| Method | Endpoint | Request Body | Response |
+|--------|----------|--------------|----------|
+| GET | `${apiUrl}/passkeys` | - | `{ success: true, data: Passkey[] }` |
+| PATCH | `${apiUrl}/passkeys/:id` | `{ nickname: string }` | `{ success: true, data: Passkey }` |
+| DELETE | `${apiUrl}/passkeys/:id` | - | `{ success: true }` |
+
+**Note:** All management endpoints require authentication (Bearer token).
+
+---
+
+## Utility Functions
+
+### isWebAuthnSupported()
+
+Checks if WebAuthn is available.
+
+```typescript
+import { isWebAuthnSupported } from '@productiongrade/passkeys/react';
+
+if (!isWebAuthnSupported()) {
+  return <p>Your browser doesn't support passkeys</p>;
+}
+```
+
+### formatPasskeyError()
+
+Converts errors to user-friendly messages.
+
+```typescript
+import { formatPasskeyError } from '@productiongrade/passkeys/react';
+
+const message = formatPasskeyError(error);
+// "Your device doesn't support passkeys. Try a different device."
+```
+
+### formatDeviceType()
+
+Formats device type for display: `'singleDevice'` → `"This Device Only"`, `'multiDevice'` → `"Synced"`.
+
+### formatTransports()
+
+Formats transport methods: `['usb', 'nfc']` → `"USB and NFC"`.
+
+---
+
+## Error Handling
+
+### Error Types
+
+All errors extend `PasskeyError`:
+
+```typescript
+interface PasskeyError extends Error {
+  code: string;
+  message: string;
+  details?: any;
+}
+```
+
+### Special Error Classes
+
+```typescript
+// WebAuthn not supported
+class WebAuthnNotSupportedError extends PasskeyError {
+  code: 'WEBAUTHN_NOT_SUPPORTED';
+}
+
+// User cancelled the ceremony
+class UserCancelledError extends PasskeyError {
+  code: 'USER_CANCELLED';
+}
+```
+
+### Error Handling Example
+
+```tsx
+import { 
+  usePasskeyRegistration, 
+  formatPasskeyError 
+} from '@productiongrade/passkeys/react';
+
+function RegisterForm() {
+  const { register, error } = usePasskeyRegistration({
+    apiUrl: '/auth',
+    onError: (error) => {
+      // Custom error handling
+      if (error.code === 'USER_CANCELLED') {
+        console.log('User cancelled registration');
+      } else if (error.code === 'WEBAUTHN_NOT_SUPPORTED') {
+        alert('Please use a modern browser');
+      } else {
+        console.error('Registration failed:', error);
+      }
+    },
+  });
+
+  return (
+    <div>
+      <button onClick={() => register('user@example.com')}>
+        Register
+      </button>
+      {error && (
+        <div className="error-message">
+          {formatPasskeyError(error)}
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+---
+
+## TypeScript
+
+All hooks are fully typed with TypeScript.
+
+### Type Imports
+
+```typescript
+import type {
+  User,
+  Passkey,
+  PasskeyError,
+  UsePasskeyRegistrationConfig,
+  UsePasskeyAuthConfig,
+  UsePasskeyManagementConfig,
+} from '@productiongrade/passkeys/react';
+```
+
+### Custom Types Example
+
+```typescript
+interface MyUser extends User {
+  displayName: string;
+}
+
+const { authenticate } = usePasskeyAuth<MyUser>({
+  apiUrl: '/auth',
+  onSuccess: (user) => {
+    // user is typed as MyUser
+    console.log(user.displayName);
+  },
+});
+```
+
+---
+
+## Examples
+
+### Complete Registration + Login Flow
+
+```tsx
+import { useState } from 'react';
+import { 
+  usePasskeyRegistration, 
+  usePasskeyAuth,
+  isWebAuthnSupported 
+} from '@productiongrade/passkeys/react';
+
+function AuthPage() {
+  const [email, setEmail] = useState('');
+  const [mode, setMode] = useState<'register' | 'login'>('login');
+
+  const registration = usePasskeyRegistration({
+    apiUrl: '/auth',
+    onSuccess: (user) => {
+      console.log('Registered:', user);
+      setMode('login');
+    },
+  });
+
+  const auth = usePasskeyAuth({
+    apiUrl: '/auth',
+    onSuccess: (user) => {
+      console.log('Logged in:', user);
+      window.location.href = '/dashboard';
+    },
+  });
+
+  if (!isWebAuthnSupported()) {
+    return (
+      <div className="error">
+        Your browser doesn't support passkeys. 
+        Please use Chrome, Safari, or Edge.
+      </div>
+    );
+  }
+
+  const isLoading = registration.isLoading || auth.isLoading;
+  const error = registration.error || auth.error;
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (mode === 'register') {
+      await registration.register(email);
+    } else {
+      await auth.authenticate(email);
+    }
+  };
+
+  return (
+    <div>
+      <h1>{mode === 'register' ? 'Create Account' : 'Sign In'}</h1>
+
+      <form onSubmit={handleSubmit}>
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="email@example.com"
+          required
+        />
+
+        <button type="submit" disabled={isLoading}>
+          {isLoading 
+            ? 'Please use your device...' 
+            : mode === 'register' 
+              ? 'Register with Passkey' 
+              : 'Sign in with Passkey'}
+        </button>
+      </form>
+
+      {error && (
+        <div className="error">
+          {error.message}
+          <button onClick={() => {
+            registration.reset();
+            auth.reset();
+          }}>
+            Try Again
+          </button>
+        </div>
+      )}
+
+      <button onClick={() => setMode(mode === 'register' ? 'login' : 'register')}>
+        {mode === 'register' 
+          ? 'Already have an account? Sign in' 
+          : 'Need an account? Register'}
+      </button>
+    </div>
+  );
+}
+```
+
+### Conditional UI / Autofill
+
+Enable "Sign in with a passkey from this device or another device" UX:
+
+```tsx
+import { usePasskeyAuth } from '@productiongrade/passkeys/react';
+
+function AutofillLogin() {
+  const { authenticate, isLoading } = usePasskeyAuth({
+    apiUrl: '/auth',
+    onSuccess: (user) => {
+      window.location.href = '/dashboard';
+    },
+  });
+
+  return (
+    <div>
+      {/* 
+        Omit email to enable WebAuthn conditional UI
+        Browser will show passkey autofill in compatible inputs
+      */}
+      <button onClick={() => authenticate()} disabled={isLoading}>
+        {isLoading ? 'Authenticating...' : 'Sign in with Passkey'}
+      </button>
+    </div>
+  );
+}
+```
+
+### Passkey Management Dashboard
+
+```tsx
+import { usePasskeyManagement, formatDeviceType } from '@productiongrade/passkeys/react';
+
+function PasskeyDashboard() {
+  const {
+    passkeys,
+    isLoading,
+    error,
+    refresh,
+    updateNickname,
+    deletePasskey,
+  } = usePasskeyManagement({
+    apiUrl: '/auth',
+    authToken: getAuthToken(), // Your session token
+  });
+
+  const handleDelete = async (id: string) => {
+    if (confirm('Delete this passkey?')) {
+      await deletePasskey(id);
+    }
+  };
+
+  if (isLoading) return <div>Loading passkeys...</div>;
+  if (error) return <div className="error">{error.message}</div>;
+
+  return (
+    <div className="passkey-dashboard">
+      <h2>Your Passkeys</h2>
+
+      {passkeys?.length === 0 ? (
+        <p>No passkeys registered yet</p>
+      ) : (
+        <ul className="passkey-list">
+          {passkeys?.map((passkey) => (
+            <li key={passkey.id} className="passkey-item">
+              <div className="passkey-info">
+                <input
+                  className="nickname-input"
+                  placeholder="Add a nickname"
+                  defaultValue={passkey.nickname || ''}
+                  onBlur={(e) => updateNickname(passkey.id, e.target.value)}
+                />
+                <span className="device-type">
+                  {formatDeviceType(passkey.deviceType)}
+                </span>
+                <span className="created-date">
+                  Added {new Date(passkey.createdAt).toLocaleDateString()}
+                </span>
+                {passkey.lastUsedAt && (
+                  <span className="last-used">
+                    Last used {new Date(passkey.lastUsedAt).toLocaleDateString()}
+                  </span>
+                )}
+              </div>
+              <button 
+                onClick={() => handleDelete(passkey.id)}
+                className="delete-button"
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <button onClick={refresh} className="refresh-button">
+        Refresh List
+      </button>
+    </div>
+  );
+}
+```
+
+### Error Boundaries
+
+```tsx
+import { ErrorBoundary } from 'react-error-boundary';
+import { formatPasskeyError } from '@productiongrade/passkeys/react';
+
+function PasskeyErrorFallback({ error, resetErrorBoundary }) {
+  return (
+    <div role="alert">
+      <h2>Authentication Error</h2>
+      <p>{formatPasskeyError(error)}</p>
+      <button onClick={resetErrorBoundary}>Try Again</button>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <ErrorBoundary FallbackComponent={PasskeyErrorFallback}>
+      <AuthPage />
+    </ErrorBoundary>
+  );
+}
+```
+
+---
+
+## Best Practices
+
+### 1. Check Browser Support
+
+Always check for WebAuthn support before rendering passkey UI:
+
+```tsx
+import { isWebAuthnSupported } from '@productiongrade/passkeys/react';
+
+if (!isWebAuthnSupported()) {
+  // Show fallback authentication method
+}
+```
+
+### 2. Handle User Cancellation Gracefully
+
+Users may cancel the WebAuthn ceremony:
+
+```tsx
+onError: (error) => {
+  if (error.code === 'USER_CANCELLED') {
+    // Don't show scary error message
+    console.log('User cancelled');
+  }
+}
+```
+
+### 3. Provide Clear Feedback
+
+WebAuthn ceremonies can take several seconds:
+
+```tsx
+{isLoading && (
+  <div className="loading">
+    <Spinner />
+    <p>Please use your fingerprint or security key...</p>
+  </div>
+)}
+```
+
+### 4. Secure Token Storage
+
+Store authentication tokens securely:
+
+```tsx
+onSuccess: (user) => {
+  // Use httpOnly cookies (server-side) or secure storage
+  secureStorage.setItem('token', authToken);
+}
+```
+
+### 5. Enable Autofill UI
+
+For better UX, support conditional UI:
+
+```tsx
+// Let browser suggest passkeys
+await authenticate(); // No email parameter
+```
+
+### 6. Test on Real Devices
+
+Always test with actual biometric devices and security keys, not just desktop browsers.
+
+---
+
+## Troubleshooting
+
+### "WebAuthn not supported"
+
+- Check browser compatibility (Chrome 67+, Safari 14+, Edge 18+)
+- Ensure HTTPS (required in production, `localhost` OK for dev)
+- Check if user is in incognito/private mode (some browsers restrict WebAuthn)
+
+### "User verification failed"
+
+- Ensure device supports biometrics or has PIN set up
+- Try different `userVerification` setting in server config
+- Check device security settings
+
+### "Challenge not found"
+
+- Ensure challenges aren't expiring too quickly (default: 5 minutes)
+- Check that challenge storage is working correctly
+- Verify clock sync between client and server
+
+### "Origin mismatch"
+
+- Ensure `origin` in server config matches actual origin
+- Include port for dev: `http://localhost:3000`
+- Match protocol exactly (http vs https)
+
+---
+
+## Next Steps
+
+- **API Reference**: See [api-reference.mdx](./api-reference.mdx)
+- **Storage Adapters**: See [storage-adapters.mdx](./storage-adapters.mdx)
+- **Migration Guide**: See [migration.mdx](./migration.mdx)
+- **Troubleshooting**: See [troubleshooting.mdx](./troubleshooting.mdx)
+

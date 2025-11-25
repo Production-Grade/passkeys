@@ -1,0 +1,394 @@
+---
+title: Testing
+description: Testing strategies, patterns, and utilities
+slug: testing
+order: 6
+---
+
+## Testing Utilities
+
+The library provides mock storage and test fixtures:
+
+```typescript
+import { 
+  createMockStorage,
+  createMockChallengeStorage,
+  createMockPasskeyConfig,
+  testFixtures 
+} from '@productiongrade/passkeys/testing';
+```
+
+These are in-memory implementations perfect for unit and integration tests.
+
+---
+
+## Unit Testing
+
+### Testing Services
+
+Test core services with mock storage:
+
+```typescript
+import { PasskeyService } from '@productiongrade/passkeys';
+import { createMockStorage, createMockPasskeyConfig } from '@productiongrade/passkeys/testing';
+
+describe('PasskeyService', () => {
+  let service: PasskeyService;
+  let storage: ReturnType<typeof createMockStorage>;
+
+  beforeEach(() => {
+    storage = createMockStorage();
+    const config = createMockPasskeyConfig();
+    service = new PasskeyService(storage, config);
+  });
+
+  it('should generate registration options', async () => {
+    const { options, userId } = await service.generateRegistrationOptions('test@example.com');
+    
+    expect(options).toBeDefined();
+    expect(options.challenge).toBeDefined();
+    expect(userId).toBeDefined();
+  });
+
+  it('should create user on registration', async () => {
+    const { userId } = await service.generateRegistrationOptions('test@example.com');
+    const user = await storage.getUserById(userId);
+    
+    expect(user).toBeDefined();
+    expect(user?.email).toBe('test@example.com');
+  });
+});
+```
+
+### Testing Error Cases
+
+Test error scenarios:
+
+```typescript
+it('should throw ValidationError for invalid email', async () => {
+  await expect(
+    service.generateRegistrationOptions('not-an-email')
+  ).rejects.toThrow(ValidationError);
+});
+
+it('should throw InvalidChallengeError for expired challenge', async () => {
+  const challenge = await challengeService.create('registration');
+  // Expire the challenge
+  await new Promise(resolve => setTimeout(resolve, 6 * 60 * 1000));
+  
+  await expect(
+    challengeService.verify(expiredClientData)
+  ).rejects.toThrow(InvalidChallengeError);
+});
+```
+
+---
+
+## Integration Testing
+
+### Testing Complete Flows
+
+Test registration and authentication end-to-end:
+
+```typescript
+import { createPasskeys } from '@productiongrade/passkeys/express';
+import { createMockStorage } from '@productiongrade/passkeys/testing';
+import request from 'supertest';
+
+describe('Registration Flow', () => {
+  let app: Express;
+  let storage: ReturnType<typeof createMockStorage>;
+
+  beforeEach(() => {
+    storage = createMockStorage();
+    const { router } = createPasskeys({
+      rpId: 'test.com',
+      rpName: 'Test',
+      origin: 'https://test.com',
+      storage,
+      challengeStorage: createMockChallengeStorage(),
+    });
+    
+    app = express();
+    app.use(express.json());
+    app.use('/auth', router);
+  });
+
+  it('should complete registration flow', async () => {
+    // Start registration
+    const startRes = await request(app)
+      .post('/auth/register/start')
+      .send({ email: 'test@example.com' });
+    
+    expect(startRes.status).toBe(200);
+    expect(startRes.body.data).toHaveProperty('challenge');
+    expect(startRes.body.userId).toBeDefined();
+    
+    // Mock WebAuthn credential (in real tests, use @simplewebauthn/testing)
+    const credential = createMockCredential(startRes.body.data);
+    
+    // Finish registration
+    const finishRes = await request(app)
+      .post('/auth/register/finish')
+      .send({
+        userId: startRes.body.userId,
+        credential,
+      });
+    
+    expect(finishRes.status).toBe(200);
+    expect(finishRes.body.data).toHaveProperty('passkey');
+  });
+});
+```
+
+### Testing with Real WebAuthn
+
+For E2E tests, you can use `@simplewebauthn/testing` to simulate WebAuthn:
+
+```typescript
+import { generateRegistrationResponse, generateAuthenticationResponse } from '@simplewebauthn/testing';
+
+it('should handle real WebAuthn flow', async () => {
+  const { options, userId } = await service.generateRegistrationOptions('test@example.com');
+  
+  // Simulate WebAuthn response
+  const credential = await generateRegistrationResponse({
+    rpID: options.rp.id,
+    origin: 'https://test.com',
+    challenge: options.challenge,
+  });
+  
+  const passkey = await service.verifyRegistration(userId, credential);
+  expect(passkey).toBeDefined();
+});
+```
+
+---
+
+## Testing Storage Adapters
+
+Use contract tests to verify your storage implementation:
+
+```typescript
+import { describe, it, expect, beforeEach } from '@jest/globals';
+import { YourStorageAdapter } from './your-adapter';
+
+describe('YourStorageAdapter Contract Tests', () => {
+  let adapter: YourStorageAdapter;
+
+  beforeEach(() => {
+    adapter = new YourStorageAdapter(/* your db connection */);
+  });
+
+  it('should create and retrieve user by email', async () => {
+    const user = await adapter.createUser({ email: 'test@example.com' });
+    const found = await adapter.getUserByEmail('test@example.com');
+    
+    expect(found).toBeDefined();
+    expect(found?.id).toBe(user.id);
+  });
+
+  it('should enforce email uniqueness', async () => {
+    await adapter.createUser({ email: 'test@example.com' });
+    
+    await expect(
+      adapter.createUser({ email: 'test@example.com' })
+    ).rejects.toThrow();
+  });
+
+  it('should cascade delete user passkeys', async () => {
+    const user = await adapter.createUser({ email: 'test@example.com' });
+    const passkey = await adapter.createPasskey({
+      userId: user.id,
+      credentialId: 'test-id',
+      publicKey: 'test-key',
+      counter: 0,
+      deviceType: 'singleDevice',
+      backedUp: false,
+    });
+    
+    await adapter.deleteUser(user.id);
+    const found = await adapter.getPasskeyById(passkey.id);
+    
+    expect(found).toBeNull();
+  });
+});
+```
+
+---
+
+## Testing React Hooks
+
+Test React hooks with React Testing Library:
+
+```typescript
+import { renderHook, waitFor } from '@testing-library/react';
+import { usePasskeyRegistration } from '@productiongrade/passkeys/react';
+
+// Mock fetch
+global.fetch = jest.fn();
+
+describe('usePasskeyRegistration', () => {
+  it('should register user', async () => {
+    (fetch as jest.Mock)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          success: true,
+          data: { challenge: 'test' },
+          userId: 'user-123',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          success: true,
+          data: { user: { id: 'user-123', email: 'test@example.com' } },
+        }),
+      });
+
+    const { result } = renderHook(() =>
+      usePasskeyRegistration({
+        apiUrl: '/api/auth',
+        onSuccess: jest.fn(),
+      })
+    );
+
+    await result.current.register('test@example.com');
+    
+    await waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+    });
+  });
+});
+```
+
+---
+
+## Testing Error Handling
+
+Test error scenarios:
+
+```typescript
+it('should handle authentication errors', async () => {
+  const { options } = await service.generateAuthenticationOptions('test@example.com');
+  
+  // Invalid credential
+  const invalidCredential = {
+    id: 'invalid',
+    rawId: 'invalid',
+    response: {
+      clientDataJSON: 'invalid',
+      authenticatorData: 'invalid',
+      signature: 'invalid',
+    },
+    type: 'public-key',
+  };
+  
+  await expect(
+    service.verifyAuthentication(invalidCredential)
+  ).rejects.toThrow(AuthenticationError);
+});
+```
+
+---
+
+## Test Fixtures
+
+Use test fixtures for common test data:
+
+```typescript
+import { testFixtures } from '@productiongrade/passkeys/testing';
+
+const user = testFixtures.createTestUser({
+  email: 'test@example.com',
+});
+
+const passkey = testFixtures.createTestPasskey({
+  userId: user.id,
+  nickname: 'Test Device',
+});
+
+const challenge = testFixtures.createTestChallenge({
+  type: 'authentication',
+  userId: user.id,
+});
+```
+
+---
+
+## Mocking WebAuthn
+
+For unit tests, you can mock the WebAuthn API:
+
+```typescript
+// Mock navigator.credentials
+global.navigator.credentials = {
+  create: jest.fn().mockResolvedValue({
+    id: 'test-id',
+    rawId: new ArrayBuffer(8),
+    response: {
+      clientDataJSON: new ArrayBuffer(8),
+      attestationObject: new ArrayBuffer(8),
+    },
+    type: 'public-key',
+  }),
+  get: jest.fn().mockResolvedValue({
+    id: 'test-id',
+    rawId: new ArrayBuffer(8),
+    response: {
+      clientDataJSON: new ArrayBuffer(8),
+      authenticatorData: new ArrayBuffer(8),
+      signature: new ArrayBuffer(8),
+    },
+    type: 'public-key',
+  }),
+} as any;
+```
+
+---
+
+## E2E Testing
+
+For end-to-end tests, use a real browser with WebAuthn support:
+
+```typescript
+import { test, expect } from '@playwright/test';
+
+test('should register and authenticate', async ({ page }) => {
+  await page.goto('http://localhost:3000');
+  
+  // Register
+  await page.fill('input[type="email"]', 'test@example.com');
+  await page.click('button:has-text("Register")');
+  
+  // WebAuthn prompt appears
+  await page.waitForSelector('[data-webauthn-prompt]');
+  // Simulate biometric (Playwright can't actually trigger WebAuthn)
+  // You'll need to use a WebAuthn testing tool or mock
+  
+  // Verify registration success
+  await expect(page.locator('.success')).toBeVisible();
+});
+```
+
+Note: Real WebAuthn testing requires special setup. Most tests use mocks or testing libraries.
+
+---
+
+## Coverage Goals
+
+Aim for:
+- **Unit tests**: 90%+ coverage of core services
+- **Integration tests**: All major flows (registration, auth, recovery)
+- **Contract tests**: All storage adapter methods
+- **Error cases**: All error paths tested
+
+---
+
+## Next Steps
+
+- [API Reference](./api-reference.mdx) - Testing utilities API
+- [Examples](./examples.mdx) - More test examples
+- [Best Practices](./best-practices.mdx) - Testing recommendations
+

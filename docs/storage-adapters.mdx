@@ -1,0 +1,584 @@
+---
+title: Storage Adapters
+description: Guide for implementing custom storage adapters for any database system
+slug: storage-adapters
+order: 3
+---
+
+## Overview
+
+Two storage interfaces to implement:
+
+1. **`PasskeyStorage`** - Users, passkeys, and recovery data (persistent)
+2. **`ChallengeStorage`** - WebAuthn challenges with 5-minute TTL (ephemeral)
+
+Implement these to connect the library to your database.
+
+---
+
+## Storage Interfaces
+
+### PasskeyStorage Interface
+
+```typescript
+interface PasskeyStorage {
+  // User operations
+  createUser(input: CreateUserInput): Promise<User>;
+  getUserById(id: string): Promise<User | null>;
+  getUserByEmail(email: string): Promise<User | null>;
+  
+  // Passkey operations
+  createPasskey(input: CreatePasskeyInput): Promise<Passkey>;
+  getPasskeyById(id: string): Promise<Passkey | null>;
+  getPasskeyByCredentialId(credentialId: string): Promise<Passkey | null>;
+  getUserPasskeys(userId: string): Promise<Passkey[]>;
+  updatePasskey(id: string, updates: Partial<Passkey>): Promise<Passkey>;
+  deletePasskey(id: string): Promise<void>;
+  
+  // Recovery code operations
+  createRecoveryCodes(inputs: CreateRecoveryCodeInput[]): Promise<RecoveryCode[]>;
+  getUserRecoveryCodes(userId: string): Promise<RecoveryCode[]>;
+  getRecoveryCodeByHash(userId: string, codeHash: string): Promise<RecoveryCode | null>;
+  markRecoveryCodeUsed(id: string): Promise<void>;
+  deleteUserRecoveryCodes(userId: string): Promise<void>;
+  
+  // Email recovery operations
+  createEmailRecoveryToken(input: CreateEmailRecoveryTokenInput): Promise<EmailRecoveryToken>;
+  getEmailRecoveryTokenByHash(tokenHash: string): Promise<EmailRecoveryToken | null>;
+  markEmailRecoveryTokenUsed(id: string): Promise<void>;
+  deleteExpiredEmailRecoveryTokens(): Promise<void>;
+}
+```
+
+### ChallengeStorage Interface
+
+```typescript
+interface ChallengeStorage {
+  createChallenge(challenge: Challenge): Promise<void>;
+  getChallengeById(id: string): Promise<Challenge | null>;
+  getChallengeByValue(challenge: string): Promise<Challenge | null>;
+  deleteChallenge(challenge: string): Promise<boolean>;
+  deleteExpiredChallenges(): Promise<void>;
+}
+```
+
+---
+
+## Implementation Requirements
+
+### PasskeyStorage Requirements
+
+- Enforce unique constraints on `User.email` and `Passkey.credentialId`
+- Cascade deletes: when a user is deleted, remove all their passkeys, recovery codes, and tokens
+- Maintain `createdAt` and `updatedAt` timestamps
+- `getUserRecoveryCodes()` must only return unused codes (`usedAt` is null)
+- `getEmailRecoveryTokenByHash()` must only return valid tokens (unused and not expired)
+
+### ChallengeStorage Requirements
+
+- Challenges expire after 5 minutes (300 seconds)
+- Delete challenges after verification (single-use)
+- Clean up expired challenges automatically (via TTL or periodic job)
+- Optimize for fast lookups—challenges are checked on every authentication
+
+---
+
+## Reference Implementations
+
+### 1. PostgreSQL with Prisma
+
+**Setup**:
+```bash
+npm install @prisma/client
+npm install -D prisma
+npx prisma init
+```
+
+**Schema** (`prisma/schema.prisma`):
+```prisma
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  passkeys            Passkey[]
+  recoveryCodes       RecoveryCode[]
+  emailRecoveryTokens EmailRecoveryToken[]
+}
+
+model Passkey {
+  id           String    @id @default(uuid())
+  userId       String
+  credentialId String    @unique
+  publicKey    String
+  counter      Int       @default(0)
+  transports   String[]
+  deviceType   String
+  backedUp     Boolean   @default(false)
+  nickname     String?
+  createdAt    DateTime  @default(now())
+  lastUsedAt   DateTime?
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([credentialId])
+}
+
+model RecoveryCode {
+  id        String    @id @default(uuid())
+  userId    String
+  codeHash  String
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([userId, usedAt])
+}
+
+model EmailRecoveryToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([tokenHash])
+}
+```
+
+**Adapter Implementation**:
+```typescript
+import { PrismaClient } from '@prisma/client';
+import { PrismaAdapter } from '@productiongrade/passkeys/adapters/prisma';
+
+const prisma = new PrismaClient();
+const storage = new PrismaAdapter(prisma);
+```
+
+---
+
+### 2. Redis for Challenge Storage
+
+**Setup**:
+```bash
+npm install redis
+```
+
+**Implementation**:
+```typescript
+import { createClient } from 'redis';
+import { RedisChallengeStorage } from '@productiongrade/passkeys/adapters/redis';
+
+const redis = createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+
+await redis.connect();
+
+const challengeStorage = new RedisChallengeStorage(redis, {
+  keyPrefix: 'passkey:challenge:' // optional, this is the default
+});
+```
+
+**Benefits**:
+- Automatic TTL expiration (no cleanup job needed)
+- High performance for concurrent requests
+- Distributed storage for multi-server deployments
+- Atomic single-use enforcement via DEL operation
+
+---
+
+### 3. In-Memory (Development Only)
+
+```typescript
+import { MemoryStorage, MemoryChallengeStorage } from '@productiongrade/passkeys/adapters/memory';
+
+const storage = new MemoryStorage();
+const challengeStorage = new MemoryChallengeStorage();
+```
+
+⚠️ **Not for production** - data is lost on restart, doesn't scale, no persistence. Development and testing only.
+
+### Testing with Mock Storage
+
+For testing, use the testing utilities:
+
+```typescript
+import { createMockStorage, createMockChallengeStorage } from '@productiongrade/passkeys/testing';
+
+const storage = createMockStorage();
+const challenges = createMockChallengeStorage();
+
+// Use in tests
+const passkeyService = new PasskeyService(storage, config);
+```
+
+See [Testing Utilities](../api-reference.mdx#testing-utilities) for more information.
+
+---
+
+## Custom Implementation Examples
+
+### Example: MongoDB with Mongoose
+
+```typescript
+import mongoose from 'mongoose';
+import type { PasskeyStorage } from '@productiongrade/passkeys';
+
+// Define schemas
+const UserSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+}, { timestamps: true });
+
+const PasskeySchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  credentialId: { type: String, required: true, unique: true },
+  publicKey: { type: String, required: true },
+  counter: { type: Number, default: 0 },
+  transports: [String],
+  deviceType: String,
+  backedUp: Boolean,
+  nickname: String,
+  lastUsedAt: Date,
+}, { timestamps: true });
+
+const User = mongoose.model('User', UserSchema);
+const Passkey = mongoose.model('Passkey', PasskeySchema);
+
+// Implement adapter
+export class MongooseAdapter implements PasskeyStorage {
+  async createUser(input) {
+    const user = await User.create({ email: input.email });
+    return {
+      id: user._id.toString(),
+      email: user.email,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    };
+  }
+
+  async getUserByEmail(email) {
+    const user = await User.findOne({ email });
+    if (!user) return null;
+    
+    return {
+      id: user._id.toString(),
+      email: user.email,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    };
+  }
+  
+  // Implement remaining methods...
+}
+```
+
+### Example: MySQL with Knex
+
+```typescript
+import type { Knex } from 'knex';
+import type { PasskeyStorage } from '@productiongrade/passkeys';
+
+export class KnexAdapter implements PasskeyStorage {
+  constructor(private readonly knex: Knex) {}
+
+  async createUser(input) {
+    const [id] = await this.knex('users').insert({
+      id: crypto.randomUUID(),
+      email: input.email,
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    
+    const user = await this.knex('users').where({ id }).first();
+    return {
+      id: user.id,
+      email: user.email,
+      createdAt: user.created_at,
+      updatedAt: user.updated_at,
+    };
+  }
+
+  async getUserByEmail(email) {
+    const user = await this.knex('users').where({ email }).first();
+    if (!user) return null;
+    
+    return {
+      id: user.id,
+      email: user.email,
+      createdAt: user.created_at,
+      updatedAt: user.updated_at,
+    };
+  }
+  
+  // Implement remaining methods...
+}
+```
+
+---
+
+## Testing Your Adapter
+
+The library provides contract tests to verify your adapter implementation:
+
+```typescript
+import { describe, it, expect, beforeEach } from '@jest/globals';
+import { YourCustomAdapter } from './your-adapter';
+
+describe('YourCustomAdapter Contract Tests', () => {
+  let adapter: YourCustomAdapter;
+
+  beforeEach(() => {
+    adapter = new YourCustomAdapter(/* your db connection */);
+  });
+
+  // User operations
+  it('should create and retrieve user by email', async () => {
+    const user = await adapter.createUser({ email: 'test@example.com' });
+    
+    expect(user).toMatchObject({
+      id: expect.any(String),
+      email: 'test@example.com',
+      createdAt: expect.any(Date),
+      updatedAt: expect.any(Date),
+    });
+
+    const retrieved = await adapter.getUserByEmail('test@example.com');
+    expect(retrieved).toEqual(user);
+  });
+
+  it('should enforce email uniqueness', async () => {
+    await adapter.createUser({ email: 'test@example.com' });
+    
+    await expect(
+      adapter.createUser({ email: 'test@example.com' })
+    ).rejects.toThrow();
+  });
+
+  // Passkey operations
+  it('should create and retrieve passkey', async () => {
+    const user = await adapter.createUser({ email: 'test@example.com' });
+    
+    const passkey = await adapter.createPasskey({
+      userId: user.id,
+      credentialId: 'test-credential-id',
+      publicKey: 'test-public-key',
+      counter: 0,
+      transports: ['internal'],
+      deviceType: 'multiDevice',
+      backedUp: false,
+    });
+
+    expect(passkey).toMatchObject({
+      id: expect.any(String),
+      userId: user.id,
+      credentialId: 'test-credential-id',
+    });
+
+    const retrieved = await adapter.getPasskeyByCredentialId('test-credential-id');
+    expect(retrieved).toEqual(passkey);
+  });
+
+  it('should enforce credential ID uniqueness', async () => {
+    const user = await adapter.createUser({ email: 'test@example.com' });
+    
+    await adapter.createPasskey({
+      userId: user.id,
+      credentialId: 'duplicate-id',
+      publicKey: 'key1',
+      counter: 0,
+      transports: [],
+      deviceType: 'multiDevice',
+      backedUp: false,
+    });
+
+    await expect(
+      adapter.createPasskey({
+        userId: user.id,
+        credentialId: 'duplicate-id',
+        publicKey: 'key2',
+        counter: 0,
+        transports: [],
+        deviceType: 'multiDevice',
+        backedUp: false,
+      })
+    ).rejects.toThrow();
+  });
+
+  // Recovery code operations
+  it('should only return unused recovery codes', async () => {
+    const user = await adapter.createUser({ email: 'test@example.com' });
+    
+    const codes = await adapter.createRecoveryCodes([
+      { userId: user.id, codeHash: 'hash1' },
+      { userId: user.id, codeHash: 'hash2' },
+    ]);
+
+    // Mark first code as used
+    await adapter.markRecoveryCodeUsed(codes[0].id);
+
+    // Should only return unused codes
+    const unused = await adapter.getUserRecoveryCodes(user.id);
+    expect(unused).toHaveLength(1);
+    expect(unused[0].codeHash).toBe('hash2');
+  });
+
+  // Email recovery token operations
+  it('should only return valid (unused, non-expired) tokens', async () => {
+    const user = await adapter.createUser({ email: 'test@example.com' });
+    
+    const validToken = await adapter.createEmailRecoveryToken({
+      userId: user.id,
+      tokenHash: 'valid-hash',
+      expiresAt: new Date(Date.now() + 3600000), // 1 hour from now
+    });
+
+    const expiredToken = await adapter.createEmailRecoveryToken({
+      userId: user.id,
+      tokenHash: 'expired-hash',
+      expiresAt: new Date(Date.now() - 3600000), // 1 hour ago
+    });
+
+    // Should return valid token
+    const retrieved = await adapter.getEmailRecoveryTokenByHash('valid-hash');
+    expect(retrieved).toEqual(validToken);
+
+    // Should not return expired token
+    const expiredRetrieved = await adapter.getEmailRecoveryTokenByHash('expired-hash');
+    expect(expiredRetrieved).toBeNull();
+  });
+});
+```
+
+---
+
+## Performance Considerations
+
+### Indexing Strategy
+
+Ensure these indexes exist for optimal performance:
+
+**Users**:
+- `email` (unique)
+
+**Passkeys**:
+- `credentialId` (unique)
+- `userId` (for listing user's passkeys)
+- `(userId, lastUsedAt)` (for sorting by recent use)
+
+**RecoveryCodes**:
+- `userId`
+- `(userId, usedAt)` (for finding unused codes)
+
+**EmailRecoveryTokens**:
+- `userId`
+- `tokenHash` (for token lookup)
+- `(usedAt, expiresAt)` (for finding valid tokens)
+
+**Challenges** (Redis):
+- No additional indexes needed - Redis key-based lookups are O(1)
+
+### Transactions
+
+Use database transactions for operations that modify multiple records:
+
+- `createRecoveryCodes()`: All codes should be created atomically
+- `deleteUserRecoveryCodes()` + `createRecoveryCodes()`: Regeneration should be atomic
+
+---
+
+## Common Pitfalls
+
+### 1. Not Filtering Unused Recovery Codes
+
+❌ **Wrong**:
+```typescript
+async getUserRecoveryCodes(userId: string) {
+  // Returns ALL codes including used ones
+  return this.db.recoveryCodes.findMany({ where: { userId } });
+}
+```
+
+✅ **Correct**:
+```typescript
+async getUserRecoveryCodes(userId: string) {
+  // Only return unused codes
+  return this.db.recoveryCodes.findMany({
+    where: { userId, usedAt: null }
+  });
+}
+```
+
+### 2. Not Validating Email Recovery Tokens
+
+❌ **Wrong**:
+```typescript
+async getEmailRecoveryTokenByHash(tokenHash: string) {
+  // Returns token even if expired or used
+  return this.db.emailRecoveryTokens.findOne({ tokenHash });
+}
+```
+
+✅ **Correct**:
+```typescript
+async getEmailRecoveryTokenByHash(tokenHash: string) {
+  const now = new Date();
+  return this.db.emailRecoveryTokens.findOne({
+    tokenHash,
+    usedAt: null,
+    expiresAt: { $gt: now }
+  });
+}
+```
+
+### 3. Missing Unique Constraints
+
+❌ **Wrong**:
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY,
+  email VARCHAR(255)  -- Missing unique constraint!
+);
+```
+
+✅ **Correct**:
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY,
+  email VARCHAR(255) UNIQUE NOT NULL
+);
+```
+
+### 4. Forgetting Cascading Deletes
+
+When a user is deleted, all related data should be automatically deleted:
+- Passkeys
+- Recovery codes
+- Email recovery tokens
+
+Configure this at the database level (e.g., `ON DELETE CASCADE`) or implement it in your adapter.
+
+---
+
+## Getting Help
+
+- Review the reference implementations: `src/adapters/prisma/` and `src/adapters/redis/`
+- Check the storage interface definitions: `src/core/types/storage.ts`
+- Run contract tests to verify your implementation
+- Open an issue on GitHub if you encounter problems
+
+---
+
+## Contributing
+
+If you've implemented an adapter for a popular database, consider contributing it to the library as a reference implementation!
+
+

@@ -1,0 +1,132 @@
+---
+title: Introduction
+description: Production-ready passkey authentication for Node.js applications
+slug: index
+order: -1
+---
+
+# @productiongrade/passkeys
+
+Production-ready passkey (WebAuthn/FIDO2) authentication library for Node.js applications. Built for Express, Next.js, and custom implementations.
+
+## Why Passkeys?
+
+Passkeys are the future of authentication:
+- **Passwordless** - No passwords to remember, leak, or phish
+- **Secure** - Built on public-key cryptography and WebAuthn standards
+- **Fast** - Sign in with Face ID, Touch ID, or security keys
+- **Universal** - Works across devices and platforms
+
+## Quick Start
+
+Install the library:
+
+```bash
+npm install @productiongrade/passkeys
+```
+
+Choose your integration path:
+
+### Express
+
+```typescript
+import { createPasskeys } from '@productiongrade/passkeys/express';
+
+const { router } = createPasskeys({
+  rpId: 'yourdomain.com',
+  rpName: 'Your App',
+  origin: 'https://yourdomain.com',
+  storage: yourStorageAdapter,
+});
+
+app.use('/api/auth', router);
+```
+
+### Next.js
+
+```typescript
+// app/api/auth/passkeys/[[...passkey]]/route.ts
+import { createNextPasskeys } from '@productiongrade/passkeys/nextjs';
+
+export const { POST, GET, DELETE, PATCH } = createNextPasskeys({
+  rpId: process.env.NEXT_PUBLIC_RP_ID!,
+  rpName: 'Your App',
+  origin: process.env.NEXT_PUBLIC_APP_URL!,
+  storage: yourStorageAdapter,
+});
+```
+
+### React
+
+```tsx
+import { usePasskeyAuth } from '@productiongrade/passkeys/react';
+
+function LoginButton() {
+  const { authenticate, isLoading } = usePasskeyAuth({
+    apiUrl: '/api/auth',
+    onSuccess: (user) => console.log('Logged in!', user),
+  });
+
+  return (
+    <button onClick={() => authenticate('user@example.com')} disabled={isLoading}>
+      Sign In with Passkey
+    </button>
+  );
+}
+```
+
+## Features
+
+- **Framework Adapters** - Express, Next.js, or use core services directly
+- **React Hooks** - Complete UI integration with `usePasskeyAuth`, `usePasskeyRegistration`, `usePasskeyManagement`
+- **Account Recovery** - Recovery codes and email-based recovery flows
+- **Storage Adapters** - Prisma, Redis, or implement your own
+- **TypeScript First** - Full type safety and IntelliSense
+- **Production Ready** - Security hooks, error handling, testing utilities
+- **Zero Dependencies** - Only peer dependencies for your chosen framework
+
+## Documentation
+
+### Getting Started
+- [Getting Started](./getting-started.mdx) - Quick setup guide for all frameworks
+- [Concepts](./concepts.mdx) - Understanding passkeys, WebAuthn, and architecture
+
+### Reference
+- [API Reference](./api-reference.mdx) - Complete API documentation
+- [Configuration](./configuration.mdx) - All configuration options and settings
+- [Examples](./examples.mdx) - Common patterns and copy-paste code samples
+
+### Guides
+- [Best Practices](./best-practices.mdx) - Security, performance, and production recommendations
+- [Deployment](./deployment.mdx) - Production deployment checklist and setup
+- [Testing](./testing.mdx) - Testing strategies, patterns, and utilities
+- [Error Handling](./error-handling.mdx) - Error types, handling patterns, and recovery
+- [Patterns](./patterns.mdx) - Real-world patterns (multi-tenant, RBAC, sessions, etc.)
+
+### Framework Integration
+- [React Integration](./react-integration.mdx) - React hooks and components guide
+- [Storage Adapters](./storage-adapters.mdx) - Database integration guide (Prisma, Redis, custom)
+- [Migration](./migration.mdx) - Migration guide from password-based authentication
+
+### Troubleshooting
+- [Troubleshooting](./troubleshooting.mdx) - Common issues and solutions
+
+## Example Application
+
+See the [React fullstack example](../examples/react-fullstack-app) for a complete working implementation with:
+- Passkey registration and authentication
+- Passkey management (list, rename, delete)
+- Recovery codes generation and authentication
+- Email recovery flow
+- Session management
+
+## Support
+
+- [GitHub Issues](https://github.com/Production-Grade/passkeys/issues) - Bug reports and feature requests
+- [GitHub Discussions](https://github.com/Production-Grade/passkeys/discussions) - Questions and community support
+- [Examples](./examples.mdx) - Working code patterns
+
+## License
+
+MIT License - see [LICENSE](../LICENSE) for details.
+

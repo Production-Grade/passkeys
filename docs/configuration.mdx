@@ -1,0 +1,320 @@
+---
+title: Configuration
+description: All configuration options, environment variables, and settings
+slug: configuration
+order: 3
+---
+
+## Required Configuration
+
+Every setup needs these three values:
+
+```typescript
+{
+  rpId: 'example.com',           // Your domain
+  rpName: 'My App',               // App name shown to users
+  origin: 'https://example.com',  // Full origin URL
+  storage: yourStorage,            // Storage implementation
+  challenges: yourChallenges,     // Challenge storage
+}
+```
+
+**rpId** must match your domain exactly. For `example.com`, use `example.com` (not `www.example.com`).  
+**origin** must include protocol and match your actual URL. Development: `http://localhost:3000`, production: `https://example.com`.
+
+---
+
+## Storage Configuration
+
+### PasskeyStorage
+
+Stores users, passkeys, and recovery data. Use Prisma adapter for PostgreSQL/MySQL/SQLite:
+
+```typescript
+import { PrismaAdapter } from '@productiongrade/passkeys/adapters/prisma';
+
+const storage = new PrismaAdapter(prisma);
+```
+
+Or implement your own. See [storage adapters](./storage-adapters.mdx).
+
+### ChallengeStorage
+
+Stores WebAuthn challenges (5-minute TTL). Use Redis in production:
+
+```typescript
+import { RedisChallengeStorage } from '@productiongrade/passkeys/adapters/redis';
+
+const challenges = new RedisChallengeStorage(redisClient);
+```
+
+For development, memory storage works:
+
+```typescript
+import { MemoryChallengeStorage } from '@productiongrade/passkeys/adapters/memory';
+
+const challenges = new MemoryChallengeStorage();
+```
+
+---
+
+## Optional Settings
+
+### Timeout
+
+How long users have to complete WebAuthn prompts. Default: 60 seconds (60000ms).
+
+```typescript
+{
+  timeout: 120000, // 2 minutes
+}
+```
+
+Increase if users are slow or on slow devices. Don't go above 5 minutes (challenges expire then).
+
+### User Verification
+
+Whether to require biometric/PIN. Default: `'preferred'`.
+
+```typescript
+{
+  userVerification: 'required',  // Must verify (most secure)
+  // or
+  userVerification: 'preferred',  // Try to verify, allow fallback
+  // or
+  userVerification: 'discouraged', // Don't prompt
+}
+```
+
+Most apps use `'preferred'`. Use `'required'` for high-security apps, but be aware some devices might not support it.
+
+### Attestation
+
+Attestation proves the authenticator's origin. Default: `'none'` (no attestation).
+
+```typescript
+{
+  attestationType: 'none',        // No attestation (most common)
+  // or
+  attestationType: 'indirect',    // Indirect attestation
+  // or
+  attestationType: 'direct',      // Direct attestation
+  // or
+  attestationType: 'enterprise',  // Enterprise attestation
+}
+```
+
+Most apps don't need attestation. Use it if you need to verify authenticator models or enterprise policies.
+
+---
+
+## Recovery Configuration
+
+### Recovery Codes
+
+One-time codes users save when registering:
+
+```typescript
+{
+  recovery: {
+    codes: {
+      enabled: true,
+      count: 10,    // How many codes (default: 10)
+      length: 16,  // Code length (default: 16)
+    },
+  },
+}
+```
+
+Codes are bcrypt-hashed before storage. Users see plaintext once—make sure they save them.
+
+### Email Recovery
+
+Token sent via email for account recovery:
+
+```typescript
+{
+  recovery: {
+    email: {
+      enabled: true,
+      sendEmail: async (to, token, userId) => {
+        await sendEmail({
+          to,
+          subject: 'Account Recovery',
+          html: `<a href="https://example.com/recover?token=${token}">Recover Account</a>`,
+        });
+      },
+      tokenTTL: 60, // Minutes (default: 60)
+    },
+  },
+}
+```
+
+Tokens are SHA-256 hashed before storage. They expire after the TTL and are single-use.
+
+You can enable both, one, or neither. Most apps enable at least one recovery method.
+
+---
+
+## Security Hooks
+
+Monitor authentication events:
+
+```typescript
+{
+  hooks: {
+    onRegistrationStart: async (userId, email) => {
+      console.log(`Registration started: ${email}`);
+    },
+    
+    onAuthSuccess: async (userId, passkeyId) => {
+      await analytics.track('user_authenticated', { userId });
+    },
+    
+    onCounterAnomaly: async (userId, passkeyId, expected, received) => {
+      // Security alert - possible cloned credential
+      await securityAlert.send({
+        userId,
+        passkeyId,
+        expected,
+        received,
+      });
+    },
+    
+    onRecoveryCodeUsed: async (userId) => {
+      // User used recovery - might indicate lost device
+      await logRecoveryUsage(userId);
+    },
+  },
+}
+```
+
+All hooks are optional. Use them for logging, analytics, or security monitoring.
+
+---
+
+## Environment Variables
+
+Recommended setup:
+
+```bash
+# Required
+RP_ID=example.com
+RP_NAME=My App
+ORIGIN=https://example.com
+
+# Database
+DATABASE_URL=postgresql://user:pass@localhost:5432/mydb
+REDIS_URL=redis://localhost:6379
+
+# Optional
+PASSKEY_TIMEOUT=60000
+USER_VERIFICATION=preferred
+```
+
+In your code:
+
+```typescript
+const config = {
+  rpId: process.env.RP_ID!,
+  rpName: process.env.RP_NAME!,
+  origin: process.env.ORIGIN!,
+  timeout: process.env.PASSKEY_TIMEOUT 
+    ? parseInt(process.env.PASSKEY_TIMEOUT) 
+    : undefined,
+  userVerification: process.env.USER_VERIFICATION as 'required' | 'preferred' | 'discouraged' | undefined,
+  // ... storage, etc.
+};
+```
+
+---
+
+## Common Configurations
+
+### Development
+
+```typescript
+{
+  rpId: 'localhost',
+  rpName: 'Dev App',
+  origin: 'http://localhost:3000',
+  storage: new MemoryStorage(),
+  challengeStorage: new MemoryChallengeStorage(),
+  userVerification: 'preferred',
+}
+```
+
+### Production (Minimal)
+
+```typescript
+{
+  rpId: process.env.RP_ID!,
+  rpName: 'My App',
+  origin: process.env.ORIGIN!,
+  storage: new PrismaAdapter(prisma),
+  challengeStorage: new RedisChallengeStorage(redis),
+  userVerification: 'preferred',
+}
+```
+
+### Production (Full Features)
+
+```typescript
+{
+  rpId: process.env.RP_ID!,
+  rpName: 'My App',
+  origin: process.env.ORIGIN!,
+  storage: new PrismaAdapter(prisma),
+  challengeStorage: new RedisChallengeStorage(redis),
+  timeout: 120000,
+  userVerification: 'preferred',
+  recovery: {
+    codes: { enabled: true, count: 10 },
+    email: {
+      enabled: true,
+      sendEmail: sendRecoveryEmail,
+      tokenTTL: 60,
+    },
+  },
+  hooks: {
+    onCounterAnomaly: handleSecurityAlert,
+    onAuthSuccess: trackAuthentication,
+  },
+}
+```
+
+---
+
+## Configuration Validation
+
+Validate your config at startup:
+
+```typescript
+import { assertValidConfig } from '@productiongrade/passkeys';
+
+const config = { /* ... */ };
+
+try {
+  assertValidConfig(config);
+  console.log('Configuration valid');
+} catch (error) {
+  console.error('Invalid configuration:', error.message);
+  process.exit(1);
+}
+```
+
+This catches common mistakes like:
+- Missing required fields
+- Invalid rpId format
+- Invalid origin format
+- Missing storage methods
+
+---
+
+## Next Steps
+
+- [API Reference](./api-reference.mdx) - Detailed API docs
+- [Best Practices](./best-practices.mdx) - Security recommendations
+- [Deployment](./deployment.mdx) - Production setup
+- [Storage Adapters](./storage-adapters.mdx) - Database setup
+

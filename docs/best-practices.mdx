@@ -1,0 +1,392 @@
+---
+title: Best Practices
+description: Security, performance, and production recommendations
+slug: best-practices
+order: 4
+---
+
+## Security
+
+### Use HTTPS in Production
+
+WebAuthn requires HTTPS (or localhost). Never use HTTP in production.
+
+```typescript
+const origin = process.env.NODE_ENV === 'production'
+  ? `https://${process.env.RP_ID}`
+  : 'http://localhost:3000';
+```
+
+### Validate Origin and RP ID
+
+Make sure your `origin` and `rpId` match exactly. Mismatches cause authentication failures.
+
+```typescript
+// Good
+rpId: 'example.com'
+origin: 'https://example.com'
+
+// Bad - mismatch
+rpId: 'example.com'
+origin: 'https://www.example.com'  // ❌ www mismatch
+```
+
+### Handle Counter Anomalies
+
+Counter anomalies indicate possible credential cloning. Log and alert:
+
+```typescript
+hooks: {
+  onCounterAnomaly: async (userId, passkeyId, expected, received) => {
+    // Log security event
+    await securityLog.create({
+      type: 'COUNTER_ANOMALY',
+      userId,
+      passkeyId,
+      severity: 'high',
+    });
+    
+    // Alert security team
+    await alertService.send({
+      channel: 'security',
+      message: `Counter anomaly: user ${userId}`,
+    });
+    
+    // Consider locking account or requiring re-verification
+    await requireUserReVerification(userId);
+  },
+}
+```
+
+### Secure Recovery Codes
+
+Recovery codes are single-use. Hash them with bcrypt (library does this automatically). Store them securely and never log plaintext codes.
+
+### Email Recovery Tokens
+
+Tokens expire after 60 minutes by default. Make them single-use and hash before storage (library handles this). Include expiration time in the email.
+
+### Rate Limiting
+
+Add rate limiting to authentication endpoints:
+
+```typescript
+import rateLimit from 'express-rate-limit';
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 attempts per window
+});
+
+app.use('/api/auth/authenticate', authLimiter);
+app.use('/api/auth/register', authLimiter);
+```
+
+### Session Security
+
+Use secure, httpOnly cookies for sessions:
+
+```typescript
+app.use(session({
+  secret: process.env.SESSION_SECRET!,
+  cookie: {
+    secure: true,      // HTTPS only
+    httpOnly: true,    // No JavaScript access
+    sameSite: 'strict',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  },
+}));
+```
+
+---
+
+## Performance
+
+### Use Redis for Challenges
+
+Challenges are high-frequency and short-lived. Redis with TTL is ideal:
+
+```typescript
+const challenges = new RedisChallengeStorage(redisClient);
+```
+
+Memory storage works for dev, but doesn't scale to multiple servers.
+
+### Database Indexing
+
+Index these fields for fast lookups:
+
+```sql
+-- Users
+CREATE INDEX idx_user_email ON users(email);
+
+-- Passkeys
+CREATE INDEX idx_passkey_credential_id ON passkeys(credential_id);
+CREATE INDEX idx_passkey_user_id ON passkeys(user_id);
+
+-- Recovery codes
+CREATE INDEX idx_recovery_user_id ON recovery_codes(user_id);
+CREATE INDEX idx_recovery_used ON recovery_codes(used_at) WHERE used_at IS NULL;
+```
+
+### Connection Pooling
+
+Use connection pooling for your database:
+
+```typescript
+// Prisma handles this automatically
+const prisma = new PrismaClient({
+  datasources: {
+    db: {
+      url: process.env.DATABASE_URL,
+    },
+  },
+});
+```
+
+### Cache User Lookups
+
+Cache user lookups if you have high traffic:
+
+```typescript
+const userCache = new Map<string, User>();
+
+async function getCachedUser(email: string) {
+  if (userCache.has(email)) {
+    return userCache.get(email);
+  }
+  const user = await storage.getUserByEmail(email);
+  if (user) {
+    userCache.set(email, user);
+    setTimeout(() => userCache.delete(email), 5 * 60 * 1000); // 5 min TTL
+  }
+  return user;
+}
+```
+
+### Monitor Performance
+
+Track authentication latency:
+
+```typescript
+hooks: {
+  onAuthStart: async (email) => {
+    const startTime = Date.now();
+    // Store in context
+  },
+  onAuthSuccess: async (userId, passkeyId) => {
+    const duration = Date.now() - startTime;
+    await metrics.record('auth.duration', duration);
+  },
+}
+```
+
+---
+
+## Error Handling
+
+### Use Type Guards
+
+Type-safe error handling:
+
+```typescript
+import { isAuthenticationError, isValidationError } from '@productiongrade/passkeys';
+
+try {
+  await passkeyService.verifyAuthentication(credential);
+} catch (error) {
+  if (isAuthenticationError(error)) {
+    // Handle auth failure
+  } else if (isValidationError(error)) {
+    // Handle validation error
+  } else {
+    // Unknown error
+  }
+}
+```
+
+### User-Friendly Messages
+
+Don't expose internal errors to users:
+
+```typescript
+try {
+  await passkeyService.verifyAuthentication(credential);
+} catch (error) {
+  if (isAuthenticationError(error)) {
+    // Show generic message
+    res.status(401).json({
+      error: 'Authentication failed. Please try again.',
+    });
+    // Log details server-side
+    logger.error('Auth failed', { error, userId });
+  }
+}
+```
+
+### Logging
+
+Log errors with context:
+
+```typescript
+hooks: {
+  onAuthFailure: async (email, error) => {
+    await logger.error('Authentication failed', {
+      email,
+      error: error.message,
+      code: error.code,
+      stack: error.stack,
+    });
+  },
+}
+```
+
+---
+
+## Testing
+
+### Use Mock Storage
+
+Use testing utilities for unit tests:
+
+```typescript
+import { createMockStorage, createMockPasskeyConfig } from '@productiongrade/passkeys/testing';
+
+const storage = createMockStorage();
+const config = createMockPasskeyConfig();
+```
+
+### Test Error Scenarios
+
+Test error handling:
+
+```typescript
+it('should handle invalid challenge', async () => {
+  const expiredChallenge = await createExpiredChallenge();
+  await expect(
+    challengeService.verify(expiredChallenge.clientDataJSON)
+  ).rejects.toThrow(InvalidChallengeError);
+});
+```
+
+### Integration Tests
+
+Test complete flows:
+
+```typescript
+it('should complete registration flow', async () => {
+  const { options, userId } = await service.generateRegistrationOptions('test@example.com');
+  const credential = await createMockCredential(options);
+  const passkey = await service.verifyRegistration(userId, credential);
+  expect(passkey).toBeDefined();
+});
+```
+
+---
+
+## Production Deployment
+
+### Environment Variables
+
+Never commit secrets. Use environment variables:
+
+```bash
+RP_ID=example.com
+RP_NAME=My App
+ORIGIN=https://example.com
+DATABASE_URL=postgresql://...
+REDIS_URL=redis://...
+SESSION_SECRET=...
+```
+
+### Database Migrations
+
+Run migrations before deploying:
+
+```bash
+npx prisma migrate deploy
+```
+
+### Health Checks
+
+Add health check endpoints:
+
+```typescript
+app.get('/health', async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    await redis.ping();
+    res.json({ status: 'ok' });
+  } catch (error) {
+    res.status(503).json({ status: 'error' });
+  }
+});
+```
+
+### Monitoring
+
+Monitor these metrics:
+- Authentication success rate
+- Registration success rate
+- Counter anomalies
+- Challenge expiration rate
+- Recovery code usage
+- Error rates by type
+
+### Backup Recovery Codes
+
+Recovery codes are critical. Consider backing them up (encrypted) or allowing regeneration.
+
+---
+
+## Common Mistakes
+
+### Wrong Origin
+
+```typescript
+// ❌ Wrong
+origin: 'example.com'  // Missing protocol
+
+// ✅ Correct
+origin: 'https://example.com'
+```
+
+### Mismatched RP ID
+
+```typescript
+// ❌ Wrong
+rpId: 'www.example.com'
+origin: 'https://example.com'  // Mismatch
+
+// ✅ Correct
+rpId: 'example.com'
+origin: 'https://example.com'
+```
+
+### Memory Storage in Production
+
+```typescript
+// ❌ Wrong - data lost on restart
+const storage = new MemoryStorage();
+
+// ✅ Correct - persistent storage
+const storage = new PrismaAdapter(prisma);
+```
+
+### No Rate Limiting
+
+Always add rate limiting to auth endpoints to prevent brute force.
+
+### Exposing Internal Errors
+
+Don't send stack traces or internal error details to clients. Log them server-side.
+
+---
+
+## Next Steps
+
+- [Deployment Guide](./deployment.mdx) - Production checklist
+- [Security Deep-Dive](./security.mdx) - Advanced security
+- [Performance Guide](./performance.mdx) - Optimization tips
+- [Troubleshooting](./troubleshooting.mdx) - Common issues
+

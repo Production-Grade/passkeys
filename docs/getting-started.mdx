@@ -1,0 +1,264 @@
+---
+title: Getting Started
+description: Get passkey authentication running in your app in minutes
+slug: getting-started
+order: 0
+---
+
+## Installation
+
+```bash
+npm install @productiongrade/passkeys
+```
+
+If you're using Express, Next.js, or React, you'll also need their peer dependencies. The library will tell you what's missing when you import it.
+
+## Choose Your Framework
+
+Pick the path that matches your stack:
+
+**Next.js 14+ (App Router)** → See [Next.js setup](#nextjs-setup)  
+**Express** → See [Express setup](#express-setup)  
+**Custom/Other** → See [Core services](#core-services)
+
+---
+
+## Next.js Setup
+
+Next.js integration takes about 10 lines of code. Create a catch-all route:
+
+```typescript
+// app/api/auth/passkeys/[[...passkey]]/route.ts
+import { createNextPasskeys } from '@productiongrade/passkeys/nextjs';
+import { PrismaAdapter } from '@productiongrade/passkeys/adapters/prisma';
+import { prisma } from '@/lib/prisma';
+
+const { POST, GET, DELETE, PATCH } = createNextPasskeys({
+  rpId: process.env.NEXT_PUBLIC_RP_ID!,
+  rpName: 'My App',
+  origin: process.env.NEXT_PUBLIC_APP_URL!,
+  storage: new PrismaAdapter(prisma),
+});
+
+export { POST, GET, DELETE, PATCH };
+```
+
+That's it. The route handles registration, authentication, and passkey management.
+
+**Environment variables:**
+```bash
+NEXT_PUBLIC_RP_ID=yourdomain.com
+NEXT_PUBLIC_APP_URL=https://yourdomain.com
+```
+
+**Using NextAuth?** Use `PasskeyProvider` instead:
+
+```typescript
+// app/api/auth/[...nextauth]/route.ts
+import NextAuth from 'next-auth';
+import { PasskeyProvider } from '@productiongrade/passkeys/nextjs/provider';
+
+const handler = NextAuth({
+  providers: [
+    PasskeyProvider({
+      rpId: process.env.NEXT_PUBLIC_RP_ID!,
+      rpName: 'My App',
+      origin: process.env.NEXT_PUBLIC_APP_URL!,
+      storage: new PrismaAdapter(prisma),
+    }),
+  ],
+});
+
+export { handler as GET, handler as POST };
+```
+
+Then use `signIn('passkey', { credential })` in your components.
+
+---
+
+## Express Setup
+
+Express integration gives you a router with all auth routes:
+
+```typescript
+import express from 'express';
+import { createPasskeys } from '@productiongrade/passkeys/express';
+import { MemoryStorage, MemoryChallengeStorage } from '@productiongrade/passkeys/adapters/memory';
+
+const app = express();
+app.use(express.json());
+
+const { router, middleware } = createPasskeys({
+  rpId: 'localhost',
+  rpName: 'My App',
+  origin: 'http://localhost:3000',
+  storage: new MemoryStorage(),
+  challengeStorage: new MemoryChallengeStorage(),
+});
+
+app.use('/api/auth', router);
+
+// Protected route
+app.get('/api/profile', middleware.requireAuth, (req, res) => {
+  res.json({ user: req.user });
+});
+
+app.listen(3000);
+```
+
+**Note:** `MemoryStorage` is for development only. For production, use a real database adapter like Prisma or implement your own. See [storage adapters](./storage-adapters.mdx).
+
+---
+
+## Core Services
+
+If you're not using Express or Next.js, use the core services directly:
+
+```typescript
+import { PasskeyService, ChallengeService } from '@productiongrade/passkeys';
+import { MemoryStorage, MemoryChallengeStorage } from '@productiongrade/passkeys/adapters/memory';
+
+const storage = new MemoryStorage();
+const challenges = new MemoryChallengeStorage();
+
+const passkeyService = new PasskeyService(storage, {
+  rpId: 'yourdomain.com',
+  rpName: 'My App',
+  origin: 'https://yourdomain.com',
+  storage,
+});
+
+const challengeService = new ChallengeService(challenges);
+
+// Generate registration options
+const { options, userId } = await passkeyService.generateRegistrationOptions('user@example.com');
+
+// After user completes WebAuthn, verify:
+const passkey = await passkeyService.verifyRegistration(userId, credential);
+```
+
+---
+
+## Frontend Integration
+
+### React
+
+Use the hooks for a complete integration:
+
+```tsx
+import { usePasskeyRegistration, usePasskeyAuth } from '@productiongrade/passkeys/react';
+
+function AuthPage() {
+  const { register, isLoading } = usePasskeyRegistration({
+    apiUrl: '/api/auth',
+    onSuccess: (user) => {
+      console.log('Registered!', user);
+    },
+  });
+
+  const { authenticate } = usePasskeyAuth({
+    apiUrl: '/api/auth',
+    onSuccess: (user) => {
+      console.log('Authenticated!', user);
+    },
+  });
+
+  return (
+    <div>
+      <button onClick={() => register('user@example.com')} disabled={isLoading}>
+        Register
+      </button>
+      <button onClick={() => authenticate('user@example.com')}>
+        Sign In
+      </button>
+    </div>
+  );
+}
+```
+
+See [React integration](./react-integration.mdx) for full details.
+
+### Vanilla JavaScript
+
+Use `@simplewebauthn/browser` directly:
+
+```typescript
+import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
+
+// Registration
+const optionsResponse = await fetch('/api/auth/register/start', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'user@example.com' }),
+});
+const { data: options, userId } = await optionsResponse.json();
+
+const credential = await startRegistration(options);
+
+await fetch('/api/auth/register/finish', {
+  method: 'POST',
+  body: JSON.stringify({ userId, credential }),
+});
+
+// Authentication
+const authOptions = await fetch('/api/auth/authenticate/start', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'user@example.com' }),
+}).then(r => r.json());
+
+const assertion = await startAuthentication(authOptions.data);
+
+await fetch('/api/auth/authenticate/finish', {
+  method: 'POST',
+  body: JSON.stringify({ credential: assertion }),
+});
+```
+
+---
+
+## First Passkey Flow
+
+Here's what happens when a user registers their first passkey:
+
+1. **User enters email** → Your app calls `/api/auth/register/start`
+2. **Server generates options** → Returns WebAuthn creation options
+3. **Browser prompts user** → Face ID, Touch ID, or security key
+4. **User authenticates** → Browser creates credential
+5. **App sends credential** → Calls `/api/auth/register/finish`
+6. **Server verifies** → Validates and saves passkey
+7. **User is registered** → Can now sign in with that device
+
+Authentication is similar—just two API calls: `/authenticate/start` and `/authenticate/finish`.
+
+---
+
+## Next Steps
+
+Once you have basic registration and authentication working:
+
+1. **Add recovery** → See [configuration](./configuration.mdx) for recovery codes and email recovery
+2. **Set up production storage** → See [storage adapters](./storage-adapters.mdx) for Prisma, Redis, or custom implementations
+3. **Add React hooks** → See [React integration](./react-integration.mdx) for frontend components
+4. **Configure security hooks** → Monitor events, handle counter anomalies
+5. **Deploy to production** → See [deployment guide](./deployment.mdx) for production checklist
+
+---
+
+## Common Issues
+
+**"WebAuthn not supported"** → Make sure you're on HTTPS (or localhost), and using a modern browser. See [troubleshooting](./troubleshooting.mdx).
+
+**"Origin mismatch"** → Your `origin` config must match the actual URL exactly, including protocol and port.
+
+**"Challenge not found"** → Challenges expire after 5 minutes. Make sure challenge storage is working (use Redis in production).
+
+**TypeScript errors** → Make sure you have the right peer dependencies installed and TypeScript can resolve the module.
+
+---
+
+## Need Help?
+
+- [API Reference](./api-reference.mdx) - Complete API docs
+- [Troubleshooting](./troubleshooting.mdx) - Common issues and fixes
+- [Examples](./examples.mdx) - Working code patterns
+- [GitHub Discussions](https://github.com/Production-Grade/passkeys/discussions) - Ask questions
+

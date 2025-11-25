@@ -1,0 +1,221 @@
+---
+title: Concepts
+description: Understanding passkeys, WebAuthn, and how this library works
+slug: concepts
+order: 1
+---
+
+## What Are Passkeys?
+
+Passkeys replace passwords with device-based authentication. Instead of typing a password, users authenticate using:
+
+- **Biometrics** - Face ID, Touch ID, Windows Hello
+- **Security keys** - Physical USB/NFC keys like YubiKey
+- **Device PIN** - Fallback when biometrics aren't available
+
+The key difference: the credential lives on the user's device, not on your server. This means no passwords to steal, phish, or leak.
+
+---
+
+## How WebAuthn Works
+
+WebAuthn is the W3C standard that makes passkeys possible. Here's the simplified flow:
+
+### Registration
+
+```
+User → Browser → Authenticator → Server
+  ↓       ↓            ↓            ↓
+Email  Creates    Generates    Stores
+       Options    Key Pair     Public Key
+```
+
+1. User provides email
+2. Server generates registration options (challenge, RP ID, etc.)
+3. Browser prompts for biometric/PIN
+4. Authenticator creates a key pair (private key stays on device)
+5. Server receives and stores the public key
+6. User can now authenticate with that device
+
+### Authentication
+
+```
+User → Browser → Authenticator → Server
+  ↓       ↓            ↓            ↓
+Email  Creates    Signs        Verifies
+       Options    Challenge    Signature
+```
+
+1. User requests to sign in
+2. Server generates authentication options (challenge, credential ID)
+3. Browser prompts for biometric/PIN
+4. Authenticator signs the challenge with the private key
+5. Server verifies the signature using the stored public key
+6. User is authenticated
+
+The private key never leaves the device. That's what makes it secure.
+
+---
+
+## Why This Library?
+
+There are a few ways to add passkeys to your app:
+
+**Option 1: Build it yourself**  
+- Implement WebAuthn spec from scratch
+- Handle challenges, verification, recovery
+- Build adapters for your database
+- Estimated time: 2-4 weeks
+
+**Option 2: Use a service**  
+- Auth0, Okta, or similar
+- Monthly costs, vendor lock-in
+- Less control over user data
+
+**Option 3: Use this library**  
+- Production-ready WebAuthn implementation
+- Framework adapters (Express, Next.js)
+- React hooks for frontend
+- Storage adapters (Prisma, Redis)
+- Full control, no vendor lock-in
+- Open source, actively maintained
+
+This library handles the hard parts (WebAuthn, challenges, recovery) so you can focus on your app.
+
+---
+
+## Architecture Overview
+
+The library is organized in layers:
+
+```
+┌─────────────────────────────────────┐
+│  Framework Adapters                 │
+│  (Express, Next.js, React)          │
+└──────────────┬──────────────────────┘
+               │
+┌──────────────▼──────────────────────┐
+│  Core Services                       │
+│  (PasskeyService, ChallengeService)  │
+└──────────────┬──────────────────────┘
+               │
+┌──────────────▼──────────────────────┐
+│  Storage Interface                   │
+│  (PasskeyStorage, ChallengeStorage) │
+└──────────────┬──────────────────────┘
+               │
+┌──────────────▼──────────────────────┐
+│  Your Database                       │
+│  (Prisma, Redis, Custom)             │
+└─────────────────────────────────────┘
+```
+
+**Framework adapters** provide ready-to-use routes and hooks.  
+**Core services** handle WebAuthn logic.  
+**Storage interface** lets you use any database.  
+**Your database** stores users, passkeys, and challenges.
+
+---
+
+## Key Concepts
+
+### Challenges
+
+Every authentication attempt uses a unique challenge (random string). Challenges:
+
+- Prevent replay attacks (can't reuse old responses)
+- Expire after 5 minutes
+- Are single-use (deleted after verification)
+
+The library handles challenge generation and verification automatically. You just need to provide storage (Redis recommended for production).
+
+### Recovery
+
+Users can lose access to their devices. The library provides two recovery methods:
+
+**Recovery codes** - One-time codes users save when registering. Bcrypt-hashed, single-use.
+
+**Email recovery** - Token sent via email. SHA-256 hashed, expires after 60 minutes (configurable).
+
+Both are optional. Enable what makes sense for your app.
+
+### Counter Anomaly Detection
+
+Each passkey has a signature counter that increments with every use. If the counter goes backwards, it could mean:
+
+- The credential was cloned
+- The authenticator is malfunctioning
+- There's a security issue
+
+The library detects this and fires a `onCounterAnomaly` hook. You decide how to respond (log, alert, lock account, etc.).
+
+### User Verification
+
+User verification means the user proves they're present (biometric, PIN, etc.). You can require it, prefer it, or allow it to be skipped:
+
+- `required` - User must verify (most secure)
+- `preferred` - Try to verify, but allow fallback
+- `discouraged` - Don't prompt for verification
+
+Most apps use `preferred` for the best balance of security and UX.
+
+---
+
+## Storage Architecture
+
+The library needs two types of storage:
+
+**PasskeyStorage** - Persistent storage for:
+- Users (email, ID, timestamps)
+- Passkeys (public keys, counters, metadata)
+- Recovery codes (hashed)
+- Email recovery tokens (hashed)
+
+**ChallengeStorage** - Ephemeral storage for:
+- Challenges (5-minute TTL)
+- Must be fast (checked on every auth)
+- Redis is ideal, memory works for dev
+
+You can use different databases for each. For example, PostgreSQL for users/passkeys, Redis for challenges.
+
+---
+
+## Security Model
+
+Passkeys are more secure than passwords because:
+
+1. **No shared secrets** - Private key never leaves the device
+2. **Phishing-resistant** - Credentials are scoped to your domain (RP ID)
+3. **No password database** - Nothing to breach
+4. **Replay protection** - Challenges prevent reuse
+5. **Counter detection** - Cloned credentials are detected
+
+The library implements all WebAuthn security requirements:
+- Challenge-based authentication
+- Origin validation
+- RP ID validation
+- Counter anomaly detection
+- Secure key storage (your responsibility for the database)
+
+---
+
+## What You Provide
+
+The library handles WebAuthn, but you provide:
+
+1. **Database** - Implement the storage interfaces (or use Prisma/Redis adapters)
+2. **Email sending** - For email recovery (if enabled)
+3. **Session management** - How you track logged-in users
+4. **UI** - Registration and login forms
+
+Everything else (challenges, verification, recovery) is handled by the library.
+
+---
+
+## Next Steps
+
+- [Getting Started](./getting-started.mdx) - Set up your first integration
+- [API Reference](./api-reference.mdx) - Detailed API docs
+- [Storage Adapters](./storage-adapters.mdx) - Connect your database
+- [Best Practices](./best-practices.mdx) - Security and performance tips
+

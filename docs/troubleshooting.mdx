@@ -1,0 +1,856 @@
+---
+title: Troubleshooting
+description: Common issues and solutions for @productiongrade/passkeys
+slug: troubleshooting
+order: 5
+---
+
+## Table of Contents
+
+- [Installation Issues](#installation-issues)
+- [WebAuthn Errors](#webauthn-errors)
+- [Registration Problems](#registration-problems)
+- [Authentication Problems](#authentication-problems)
+- [Storage & Database Issues](#storage--database-issues)
+- [Express Integration Issues](#express-integration-issues)
+- [React Hooks Issues](#react-hooks-issues)
+- [Production Deployment](#production-deployment)
+- [Browser Compatibility](#browser-compatibility)
+- [Performance Issues](#performance-issues)
+
+---
+
+## Installation Issues
+
+### Peer Dependency Warnings
+
+If you see peer dependency warnings, install the missing packages:
+
+```bash
+# For Express usage
+npm install express bcrypt
+
+# For React usage
+npm install react @simplewebauthn/browser
+
+# For Prisma adapter
+npm install @prisma/client
+
+# For Redis adapter  
+npm install redis
+```
+
+### TypeScript Errors After Install
+
+If TypeScript can't find the module:
+
+1. Check your `tsconfig.json`:
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "types": ["node"]
+  }
+}
+```
+
+2. Restart TypeScript server (VS Code: `Cmd+Shift+P` → "Restart TS Server")
+
+3. If using subpath imports, ensure correct syntax:
+```typescript
+// ✅ Correct
+import { createPasskeys } from '@productiongrade/passkeys/express';
+import { usePasskeyAuth } from '@productiongrade/passkeys/react';
+
+// ❌ Wrong
+import { createPasskeys } from '@productiongrade/passkeys/express/index';
+```
+
+---
+
+## WebAuthn Errors
+
+### "WebAuthn is not supported in this browser"
+
+Common causes: outdated browser, HTTP in production, incognito mode, or browser security settings.
+
+**Browser support:**
+- Chrome/Edge: 67+
+- Firefox: 60+
+- Safari: 14+
+
+**Fix:**
+```typescript
+// localhost is OK for development
+// Production MUST use HTTPS
+const config = {
+  origin: process.env.NODE_ENV === 'production' 
+    ? 'https://example.com'
+    : 'http://localhost:3000'
+};
+```
+
+3. **Check in React:**
+```typescript
+import { isWebAuthnSupported } from '@productiongrade/passkeys/react';
+
+if (!isWebAuthnSupported()) {
+  return <div>Please use a modern browser</div>;
+}
+```
+
+### "User verification is not supported"
+
+Device doesn't have biometrics or PIN set up.
+
+**Fix:**
+```typescript
+createPasskeys({
+  // ...
+  userVerification: 'preferred', // Falls back gracefully
+});
+```
+
+2. Prompt user to set up device security:
+```typescript
+onError: (error) => {
+  if (error.message.includes('user verification')) {
+    alert('Please set up a PIN or biometrics on your device');
+  }
+}
+```
+
+---
+
+## Registration Problems
+
+### "Challenge not found"
+
+Usually means the challenge expired (5 minutes), clock skew, storage issue, or user took too long.
+
+**Fix:**
+```typescript
+createPasskeys({
+  // ...
+  timeout: 120000, // 2 minutes instead of 1
+});
+```
+
+2. **Check challenge storage:**
+```typescript
+// Ensure challenge storage is working
+const challenge = await challengeStorage.getChallengeById(id);
+console.log('Challenge:', challenge); // Should exist
+```
+
+3. **Add user guidance:**
+```tsx
+<button onClick={register}>
+  Register
+</button>
+<p className="hint">
+  Please complete within 5 minutes
+</p>
+```
+
+### "Invalid origin"
+
+**Cause:** Origin mismatch between config and actual request origin.
+
+**Solution:**
+
+1. **Match origins exactly:**
+```typescript
+// ✅ Include protocol and port
+const config = {
+  origin: 'https://example.com:3000', // Exact match
+};
+
+// ❌ Don't omit protocol
+const config = {
+  origin: 'example.com', // Wrong!
+};
+```
+
+2. **For development with different ports:**
+```typescript
+const config = {
+  origin: `http://localhost:${process.env.PORT || 3000}`,
+};
+```
+
+3. **Check browser console:**
+```
+Expected origin: https://example.com
+Received origin: https://www.example.com  ❌
+```
+
+### "Email already exists"
+
+User is trying to register with an email that's already in use.
+
+**Fix:**
+```typescript
+app.post('/register/start', async (req, res) => {
+  const { email } = req.body;
+  
+  const existing = await storage.getUserByEmail(email);
+  if (existing) {
+    return res.status(400).json({
+      error: 'Email already registered',
+      suggestion: 'Try signing in instead',
+    });
+  }
+  
+  // Continue with registration...
+});
+```
+
+2. **Guide user to login:**
+```tsx
+onError: (error) => {
+  if (error.code === 'EMAIL_EXISTS') {
+    navigate('/login');
+  }
+}
+```
+
+---
+
+## Authentication Problems
+
+### "Passkey not found"
+
+User hasn't registered, passkey was deleted, wrong email, or credential ID mismatch.
+
+**Fix:**
+```typescript
+const user = await storage.getUserByEmail(email);
+if (!user) {
+  return res.status(404).json({
+    error: 'No account found',
+    suggestion: 'Please register first',
+  });
+}
+```
+
+2. **Verify passkeys exist:**
+```typescript
+const passkeys = await storage.getUserPasskeys(userId);
+if (passkeys.length === 0) {
+  return res.status(400).json({
+    error: 'No passkeys registered',
+    suggestion: 'Please add a passkey in settings',
+  });
+}
+```
+
+3. **Enable autofill UI:**
+```typescript
+// Let user pick from any passkey
+const { options } = await generateAuthenticationOptions();
+// No email filtering
+```
+
+### "Counter anomaly detected"
+
+Signature counter went backwards—possible cloned credential or authenticator issue.
+
+**Security response (recommended):**
+```typescript
+hooks: {
+  onCounterAnomaly: async (userId, passkeyId, expected, received) => {
+    // Log security event
+    await securityLog.create({
+      type: 'COUNTER_ANOMALY',
+      userId,
+      passkeyId,
+      expected,
+      received,
+    });
+    
+    // Alert security team
+    await alerts.send('Counter anomaly detected', {
+      userId,
+      expected,
+      received,
+    });
+    
+    // Optionally: Lock account
+    await accounts.requireReverification(userId);
+  },
+}
+```
+
+**For development/testing:**
+Some test authenticators have buggy counters. Only disable in dev.
+
+**User guidance:**
+```tsx
+<Alert variant="error">
+  Security issue detected with your passkey.
+  Please remove it and add a new one.
+</Alert>
+```
+
+### "User cancelled"
+
+User dismissed the WebAuthn prompt. Handle gracefully—this isn't an error:
+
+```typescript
+onError: (error) => {
+  if (error.code === 'USER_CANCELLED') {
+    // Don't show error - user intentionally cancelled
+    console.log('User cancelled authentication');
+    return;
+  }
+  
+  // Show other errors
+  setError(error);
+}
+```
+
+---
+
+## Storage & Database Issues
+
+### Prisma "Table does not exist"
+
+**Cause:** Missing database migration.
+
+**Solution:**
+
+1. **Run migrations:**
+```bash
+npx prisma migrate dev
+```
+
+2. **Generate Prisma client:**
+```bash
+npx prisma generate
+```
+
+3. **Check connection:**
+```bash
+npx prisma db pull
+```
+
+### Redis Connection Failures
+
+**Cause:** Redis not running or connection config wrong.
+
+**Solution:**
+
+1. **Start Redis:**
+```bash
+# macOS
+brew services start redis
+
+# Ubuntu
+sudo systemctl start redis
+
+# Docker
+docker run -d -p 6379:6379 redis:7-alpine
+```
+
+2. **Check connection:**
+```typescript
+import { createClient } from 'redis';
+
+const redis = createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+
+redis.on('error', (err) => console.error('Redis error:', err));
+redis.on('connect', () => console.log('Redis connected'));
+
+await redis.connect();
+```
+
+3. **Fallback to memory storage:**
+```typescript
+const challengeStorage = process.env.REDIS_URL
+  ? new RedisChallengeStorage(redis)
+  : new MemoryChallengeStorage(); // Fallback for dev
+```
+
+### "Unique constraint violation"
+
+**Cause:** Trying to create duplicate user/passkey.
+
+**Solution:**
+
+1. **Check before creating:**
+```typescript
+// Use upsert instead
+const user = await prisma.user.upsert({
+  where: { email },
+  update: {},
+  create: { email },
+});
+```
+
+2. **Handle gracefully:**
+```typescript
+try {
+  await storage.createUser({ email });
+} catch (error) {
+  if (error.code === 'P2002') { // Prisma unique constraint
+    return await storage.getUserByEmail(email);
+  }
+  throw error;
+}
+```
+
+---
+
+## Express Integration Issues
+
+### Routes Not Responding
+
+**Cause:** Router not mounted or middleware issues.
+
+**Solution:**
+
+1. **Verify mount point:**
+```typescript
+const { router } = createPasskeys(config);
+
+// ✅ Correct
+app.use('/auth', router);
+
+// ❌ Wrong - missing base path
+app.use(router);
+
+// Test:
+// curl http://localhost:3000/auth/register/start
+```
+
+2. **Check middleware order:**
+```typescript
+// ✅ Correct order
+app.use(express.json()); // Body parser FIRST
+app.use('/auth', router); // Then routes
+
+// ❌ Wrong - body parser after routes
+app.use('/auth', router);
+app.use(express.json()); // Too late!
+```
+
+3. **Verify JSON parsing:**
+```typescript
+// Add logging middleware
+app.use('/auth', (req, res, next) => {
+  console.log('Request:', req.method, req.path, req.body);
+  next();
+});
+```
+
+### CORS Errors
+
+**Cause:** Frontend and backend on different origins.
+
+**Solution:**
+
+1. **Enable CORS:**
+```typescript
+import cors from 'cors';
+
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true,
+}));
+
+app.use('/auth', router);
+```
+
+2. **For production:**
+```typescript
+app.use(cors({
+  origin: (origin, callback) => {
+    const allowed = [
+      'https://example.com',
+      'https://www.example.com',
+    ];
+    
+    if (!origin || allowed.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+}));
+```
+
+### Authentication Middleware Not Working
+
+**Cause:** `req.user` not set or middleware not applied.
+
+**Solution:**
+
+1. **Set user in session middleware:**
+```typescript
+// Your session middleware
+app.use(async (req, res, next) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (token) {
+    const session = await getSession(token);
+    (req as any).user = { id: session.userId };
+  }
+  next();
+});
+
+// Then apply requireAuth
+app.get('/profile', requireAuth, (req, res) => {
+  // req.user.id is now available
+});
+```
+
+2. **Check requireAuth usage:**
+```typescript
+import { requireAuth } from '@productiongrade/passkeys/express';
+
+// ✅ Correct
+app.get('/protected', requireAuth, handler);
+
+// ❌ Wrong - calling it instead of passing it
+app.get('/protected', requireAuth(), handler); // Don't call it
+```
+
+---
+
+## React Hooks Issues
+
+### "React Hook called outside of component"
+
+**Cause:** Using hooks in non-component context.
+
+**Solution:**
+
+```typescript
+// ❌ Wrong - outside component
+const { register } = usePasskeyRegistration({...});
+
+function MyComponent() {
+  return <button onClick={register}>Register</button>;
+}
+
+// ✅ Correct - inside component
+function MyComponent() {
+  const { register } = usePasskeyRegistration({...});
+  return <button onClick={register}>Register</button>;
+}
+```
+
+### Hooks Not Re-rendering
+
+**Cause:** State not triggering re-render.
+
+**Solution:**
+
+1. **Check dependency array:**
+```typescript
+useEffect(() => {
+  refresh();
+}, [userId]); // Add dependencies
+```
+
+2. **Force refresh:**
+```typescript
+const { passkeys, refresh } = usePasskeyManagement({...});
+
+// Manually refresh after changes
+await deletePasskey(id);
+await refresh(); // Update state
+```
+
+### "Network Error" in Hooks
+
+**Cause:** API endpoint incorrect or unreachable.
+
+**Solution:**
+
+1. **Verify API URL:**
+```typescript
+const { register } = usePasskeyRegistration({
+  apiUrl: '/api/auth', // Check this matches your backend
+  onError: (error) => {
+    console.error('API Error:', error);
+    console.error('Attempted URL:', '/api/auth/register/start');
+  },
+});
+```
+
+2. **Check fetch errors:**
+```typescript
+// In browser console
+fetch('/api/auth/register/start', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ email: 'test@example.com' }),
+})
+.then(r => r.json())
+.then(console.log)
+.catch(console.error);
+```
+
+---
+
+## Production Deployment
+
+### HTTPS Certificate Issues
+
+**Cause:** Invalid SSL certificate or mixed content.
+
+**Solution:**
+
+1. **Use valid certificate:**
+```bash
+# Let's Encrypt (free)
+certbot certonly --webroot -w /var/www/html -d example.com
+```
+
+2. **Check certificate validity:**
+```bash
+openssl s_client -connect example.com:443 -servername example.com
+```
+
+3. **Force HTTPS:**
+```typescript
+app.use((req, res, next) => {
+  if (req.header('x-forwarded-proto') !== 'https') {
+    res.redirect(`https://${req.header('host')}${req.url}`);
+  } else {
+    next();
+  }
+});
+```
+
+### Environment Variables Not Loading
+
+**Cause:** Missing .env file or incorrect loading.
+
+**Solution:**
+
+1. **Use dotenv:**
+```typescript
+import 'dotenv/config'; // Top of entry file
+
+const config = {
+  rpId: process.env.RP_ID,
+  origin: process.env.ORIGIN,
+};
+```
+
+2. **Verify loaded:**
+```bash
+node -e "require('dotenv').config(); console.log(process.env.RP_ID)"
+```
+
+3. **For production (use secrets manager):**
+```bash
+# Set in hosting platform
+# Heroku: heroku config:set RP_ID=example.com
+# Vercel: vercel env add RP_ID
+```
+
+### High Memory Usage
+
+**Cause:** Memory storage in production (not for production use!).
+
+**Solution:**
+
+```typescript
+// ❌ Wrong for production
+const storage = new MemoryStorage();
+
+// ✅ Use database
+const storage = new PrismaAdapter(prisma);
+const challengeStorage = new RedisChallengeStorage(redis);
+```
+
+---
+
+## Browser Compatibility
+
+### Safari Issues
+
+**Problem:** WebAuthn not working in Safari < 14.
+
+**Solution:**
+
+1. **Check version:**
+```typescript
+const isSupported = window.PublicKeyCredential !== undefined;
+```
+
+2. **Show upgrade message:**
+```tsx
+{!isSupported && (
+  <Alert>
+    Please update Safari to version 14 or later
+    to use passkey authentication.
+  </Alert>
+)}
+```
+
+### Firefox Private Mode
+
+**Problem:** WebAuthn disabled in Private Browsing.
+
+**Solution:**
+
+```tsx
+// Detect and inform user
+{!isWebAuthnSupported() && (
+  <Alert>
+    Passkeys don't work in Private Browsing mode.
+    Please use normal mode or try Chrome/Safari.
+  </Alert>
+)}
+```
+
+### Mobile Browser Issues
+
+**Problem:** Different behavior on mobile browsers.
+
+**Solution:**
+
+1. **Test on actual devices** (simulators aren't reliable for WebAuthn)
+
+2. **Handle platform differences:**
+```typescript
+const platform = navigator.userAgent.includes('iPhone') ? 'iOS' : 'Android';
+
+// iOS Face ID prompt is different from Android fingerprint
+```
+
+---
+
+## Performance Issues
+
+### Slow Registration/Authentication
+
+**Causes:**
+- Database queries not optimized
+- Network latency
+- Large passkey counts
+
+**Solutions:**
+
+1. **Add database indexes:**
+```prisma
+model Passkey {
+  // ...
+  @@index([userId])
+  @@index([userId, lastUsedAt])
+}
+```
+
+2. **Cache user passkeys:**
+```typescript
+const cache = new Map();
+
+const getUserPasskeys = async (userId) => {
+  if (cache.has(userId)) {
+    return cache.get(userId);
+  }
+  
+  const passkeys = await storage.getUserPasskeys(userId);
+  cache.set(userId, passkeys);
+  return passkeys;
+};
+```
+
+3. **Limit response size:**
+```typescript
+// Don't send full passkey list unless needed
+const { options } = await passkeyService.generateAuthenticationOptions(email);
+// Only sends credential IDs, not full passkeys
+```
+
+---
+
+## Still Having Issues?
+
+1. **Enable debug logging:**
+```typescript
+// Set environment variable
+process.env.DEBUG = '@productiongrade/passkeys:*';
+
+// Or use the debug utilities
+import { debugLog, debugError } from '@productiongrade/passkeys';
+
+debugLog('PasskeyService', 'Starting registration', { userId, email });
+```
+
+2. **Use type guards for better error handling:**
+```typescript
+import { isAuthenticationError, getErrorDetails } from '@productiongrade/passkeys';
+
+try {
+  await passkeyService.authenticate(...);
+} catch (error) {
+  if (isAuthenticationError(error)) {
+    const details = getErrorDetails(error);
+    if (details?.details?.troubleshooting) {
+      console.log('Troubleshooting:', details.details.troubleshooting);
+      console.log('Common causes:', details.details.commonCauses);
+    }
+  }
+}
+```
+
+3. **Validate your configuration:**
+```typescript
+import { validatePasskeyConfig } from '@productiongrade/passkeys';
+
+const result = validatePasskeyConfig(config);
+if (!result.valid) {
+  console.error('Configuration errors:', result.errors);
+  console.warn('Warnings:', result.warnings);
+}
+```
+
+4. **Check existing issues:** https://github.com/Production-Grade/passkeys/issues
+
+5. **Ask for help:** https://github.com/Production-Grade/passkeys/discussions
+
+6. **Contact support:** support@productiongrade.tech
+
+---
+
+## Useful Commands
+
+```bash
+# Check package version
+npm list @productiongrade/passkeys
+
+# Update to latest
+npm update @productiongrade/passkeys
+
+# Clear node_modules and reinstall
+rm -rf node_modules package-lock.json
+npm install
+
+# Test database connection
+npx prisma db push --preview-feature
+
+# Check TypeScript compilation
+npx tsc --noEmit
+
+# Run with debug logs
+DEBUG=@productiongrade/passkeys:* npm start
+```
+
+---
+
+## Related Documentation
+
+- [API Reference](./api-reference.mdx)
+- [Migration Guide](./migration.mdx)
+- [React Hooks](./react-integration.mdx)
+- [Storage Adapters](./storage-adapters.mdx)
+
